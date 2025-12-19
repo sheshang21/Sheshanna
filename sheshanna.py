@@ -11,6 +11,7 @@ import warnings
 import json
 import time
 import re
+from functools import wraps
 warnings.filterwarnings('ignore')
 
 # Statistical and ML imports
@@ -19,6 +20,33 @@ from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import ta
+
+# Rate limiting decorator
+def rate_limit_retry(max_retries=3, delay=2):
+    """Decorator to handle rate limiting with exponential backoff"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    result = func(*args, **kwargs)
+                    return result
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if 'rate limit' in error_msg or 'too many requests' in error_msg or '429' in error_msg:
+                        if attempt < max_retries - 1:
+                            wait_time = delay * (2 ** attempt)  # Exponential backoff
+                            st.warning(f"Rate limited. Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            st.error("Rate limit exceeded. Please try again in a few minutes.")
+                            return None
+                    else:
+                        raise e
+            return None
+        return wrapper
+    return decorator
 
 # Page configuration
 st.set_page_config(
@@ -160,8 +188,9 @@ def get_nse_shareholding(symbol):
         return None
 
 @st.cache_data(ttl=3600)
+@rate_limit_retry(max_retries=3, delay=3)
 def get_stock_data(ticker):
-    """Fetch stock data from Yahoo Finance and NSE"""
+    """Fetch stock data from Yahoo Finance and NSE with rate limiting"""
     try:
         # Store original ticker for NSE
         nse_symbol = ticker.upper()
@@ -170,9 +199,41 @@ def get_stock_data(ticker):
         if not ticker.endswith('.NS'):
             ticker = ticker + '.NS'
         
-        stock = yf.Ticker(ticker)
-        data = stock.history(period="max")
-        info = stock.info
+        # Add a small delay to avoid rate limiting
+        time.sleep(0.5)
+        
+        # Create ticker object with session
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        
+        stock = yf.Ticker(ticker, session=session)
+        
+        # Try to get data with error handling
+        try:
+            data = stock.history(period="max")
+        except Exception as e:
+            if 'rate limit' in str(e).lower() or '429' in str(e):
+                raise e  # Re-raise to trigger retry
+            # Try shorter period if max fails
+            st.warning("Fetching last 5 years of data instead of full history...")
+            data = stock.history(period="5y")
+        
+        if data is None or len(data) == 0:
+            raise ValueError(f"No data returned for {ticker}")
+        
+        # Get info with error handling
+        try:
+            info = stock.info
+        except Exception as e:
+            st.warning(f"Could not fetch all company info: {str(e)[:100]}")
+            # Create minimal info dict
+            info = {
+                'longName': nse_symbol,
+                'symbol': nse_symbol,
+                'currentPrice': data['Close'].iloc[-1] if len(data) > 0 else None
+            }
         
         # Convert data to dict for serialization
         data_dict = {
@@ -182,16 +243,26 @@ def get_stock_data(ticker):
         
         # Calculate proper beta vs Nifty 50
         if data is not None and len(data) > 0:
-            calculated_beta = calculate_beta_vs_nifty(data, ticker)
-            if calculated_beta is not None:
-                info['calculatedBeta'] = calculated_beta
+            try:
+                calculated_beta = calculate_beta_vs_nifty(data, ticker)
+                if calculated_beta is not None:
+                    info['calculatedBeta'] = calculated_beta
+            except:
+                pass  # Beta calculation is optional
         
-        # Get NSE data
-        nse_data = scrape_nse_stock_info(nse_symbol)
+        # Get NSE data (optional, don't fail if unavailable)
+        nse_data = None
+        try:
+            nse_data = scrape_nse_stock_info(nse_symbol)
+        except:
+            pass  # NSE data is optional
         
         return data_dict, info, nse_data, nse_symbol
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        error_msg = str(e)
+        if 'rate limit' in error_msg.lower() or '429' in error_msg:
+            raise e  # Re-raise for retry decorator
+        st.error(f"Error fetching data: {error_msg}")
         return None, None, None, None
 
 def reconstruct_dataframe(data_dict):
@@ -201,6 +272,61 @@ def reconstruct_dataframe(data_dict):
     df = pd.DataFrame(data_dict['data'])
     df.index = pd.DatetimeIndex(data_dict['index'])
     return df
+
+@st.cache_data(ttl=3600)
+def get_stock_data_fallback(ticker):
+    """Fallback method using NSE data directly"""
+    try:
+        nse_symbol = ticker.upper()
+        
+        # Try to get basic data from NSE
+        session = create_nse_session()
+        
+        # Get quote
+        quote_url = f"https://www.nseindia.com/api/quote-equity?symbol={nse_symbol}"
+        response = session.get(quote_url, timeout=10)
+        
+        if response.status_code == 200:
+            nse_data = response.json()
+            
+            # Extract basic info
+            price_info = nse_data.get('priceInfo', {})
+            
+            info = {
+                'longName': nse_data.get('info', {}).get('companyName', nse_symbol),
+                'symbol': nse_symbol,
+                'currentPrice': price_info.get('lastPrice'),
+                'previousClose': price_info.get('previousClose'),
+                'open': price_info.get('open'),
+                'dayHigh': price_info.get('intraDayHighLow', {}).get('max'),
+                'dayLow': price_info.get('intraDayHighLow', {}).get('min'),
+                'fiftyTwoWeekHigh': price_info.get('weekHighLow', {}).get('max'),
+                'fiftyTwoWeekLow': price_info.get('weekHighLow', {}).get('min'),
+                'volume': nse_data.get('securityWiseDP', {}).get('quantityTraded'),
+                'sector': nse_data.get('industryInfo', {}).get('sector'),
+                'industry': nse_data.get('industryInfo', {}).get('industry'),
+            }
+            
+            st.warning("⚠️ Using NSE data only. Historical analysis limited. Try again later for full data from Yahoo Finance.")
+            
+            # Create minimal dataframe with just current data
+            data_dict = {
+                'data': {
+                    'Open': {pd.Timestamp.now(): info.get('open')},
+                    'High': {pd.Timestamp.now(): info.get('dayHigh')},
+                    'Low': {pd.Timestamp.now(): info.get('dayLow')},
+                    'Close': {pd.Timestamp.now(): info.get('currentPrice')},
+                    'Volume': {pd.Timestamp.now(): info.get('volume')},
+                },
+                'index': [pd.Timestamp.now()]
+            }
+            
+            return data_dict, info, nse_data, nse_symbol
+        
+        return None, None, None, None
+    except Exception as e:
+        st.error(f"Fallback also failed: {str(e)}")
+        return None, None, None, None
 
 def identify_major_fluctuations(data, threshold=5):
     """Identify major price fluctuations (peaks and troughs)"""
@@ -643,12 +769,56 @@ def main():
         
         st.markdown("---")
         analyze_button = st.button("🚀 Analyze Stock", type="primary")
+        
+        # Add helpful tips
+        st.markdown("---")
+        st.info("💡 **Tips:**")
+        st.markdown("""
+        - First load may take 10-20 seconds
+        - Data is cached for 1 hour
+        - If you see rate limit errors, wait 2-3 minutes
+        - Try different tickers if one fails
+        """)
+        
+        with st.expander("📋 Popular Tickers"):
+            st.markdown("""
+            **Large Cap:**
+            - RELIANCE
+            - TCS
+            - INFY
+            - HDFCBANK
+            - ICICIBANK
+            
+            **Mid Cap:**
+            - BAJAJFINSV
+            - LTIM
+            - PERSISTENT
+            """)
+        
+        with st.expander("⚠️ Rate Limit Info"):
+            st.markdown("""
+            If you encounter rate limiting:
+            
+            1. **Wait 2-3 minutes** before retrying
+            2. Data is **cached for 1 hour** once loaded
+            3. App uses **multiple data sources**
+            4. **NSE fallback** available if Yahoo Finance fails
+            
+            Rate limits are imposed by data providers, not this app.
+            """)
     
     if analyze_button and ticker_input:
         ticker = ticker_input.strip().upper()
         
-        with st.spinner(f"Fetching data for {ticker}..."):
+        with st.spinner(f"Fetching data for {ticker}... This may take a few moments..."):
+            # Try primary method
             data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
+            
+            # If primary fails and it's a rate limit issue, try fallback
+            if data_dict is None and info is None:
+                st.warning("Primary data source unavailable. Trying alternative method...")
+                time.sleep(2)
+                data_dict, info, nse_data, nse_symbol = get_stock_data_fallback(ticker)
         
         if data_dict is not None and info:
             # Reconstruct DataFrame from cached dict
@@ -656,7 +826,18 @@ def main():
             
             if data is None or len(data) == 0:
                 st.error(f"❌ No historical data available for ticker '{ticker}'.")
+                st.info("💡 **Tip**: This might be due to:")
+                st.markdown("""
+                - Rate limiting from data provider (wait a few minutes)
+                - Incorrect ticker symbol (verify on NSE website)
+                - Recently listed stock (limited history)
+                - Network connectivity issues
+                """)
                 return
+            
+            # Show data source info
+            if len(data) < 50:
+                st.warning("⚠️ Limited historical data available. Some analyses may be restricted.")
             
             # Company Header
             company_name = info.get('longName', ticker)
@@ -671,11 +852,15 @@ def main():
                 with st.expander("📊 View NSE Live Data"):
                     try:
                         nse_info = nse_data.get('priceInfo', {})
-                        st.write(f"**Last Price (NSE):** ₹{nse_info.get('lastPrice', 'N/A')}")
-                        st.write(f"**Change:** ₹{nse_info.get('change', 'N/A')} ({nse_info.get('pChange', 'N/A')}%)")
-                        st.write(f"**52W High:** ₹{nse_info.get('weekHighLow', {}).get('max', 'N/A')}")
-                        st.write(f"**52W Low:** ₹{nse_info.get('weekHighLow', {}).get('min', 'N/A')}")
-                        st.write(f"**Total Traded Volume:** {nse_data.get('securityWiseDP', {}).get('quantityTraded', 'N/A'):,}")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write(f"**Last Price (NSE):** ₹{nse_info.get('lastPrice', 'N/A')}")
+                            st.write(f"**Change:** ₹{nse_info.get('change', 'N/A')} ({nse_info.get('pChange', 'N/A')}%)")
+                            st.write(f"**Open:** ₹{nse_info.get('open', 'N/A')}")
+                        with col2:
+                            st.write(f"**52W High:** ₹{nse_info.get('weekHighLow', {}).get('max', 'N/A')}")
+                            st.write(f"**52W Low:** ₹{nse_info.get('weekHighLow', {}).get('min', 'N/A')}")
+                            st.write(f"**Volume:** {nse_data.get('securityWiseDP', {}).get('quantityTraded', 'N/A'):,}")
                     except:
                         st.json(nse_data)
             
@@ -1119,10 +1304,53 @@ def main():
                         """)
         
         else:
-            st.error(f"❌ Could not fetch data for ticker '{ticker}'. Please verify the ticker symbol is correct and listed on NSE.")
+            st.error(f"❌ Could not fetch data for ticker '{ticker}'.")
+            st.info("### Possible Solutions:")
+            st.markdown("""
+            1. **Rate Limiting**: Wait 2-3 minutes and try again
+            2. **Verify Ticker**: Check the symbol on [NSE Website](https://www.nseindia.com)
+            3. **Try Another Stock**: Some tickers may have data issues
+            4. **Check Spelling**: Ensure ticker is spelled correctly (e.g., RELIANCE, not RELINCE)
+            5. **Network Issues**: Check your internet connection
+            
+            **Note**: If deployed on Streamlit Cloud, rate limiting is common due to shared IPs. 
+            Data is cached once successfully loaded, so subsequent requests are faster.
+            """)
     
     elif not ticker_input:
         st.info("👈 Please enter an NSE ticker symbol in the sidebar and click 'Analyze Stock'")
+        
+        # Show welcome message
+        st.markdown("""
+        ## Welcome to Advanced Stock Analysis Tool! 📈
+        
+        ### Features:
+        - 📊 **Major Price Fluctuations** - Identify peaks and troughs
+        - 📈 **Statistical Analysis** - 30+ metrics with interpretations
+        - 🔮 **Price Forecasting** - 4 models with ensemble predictions
+        - 💰 **Valuation Metrics** - P/E, P/B, ROE, Beta (vs Nifty 50)
+        - 📰 **News & Events** - Latest updates and corporate actions
+        - 🏦 **NSE Data** - Direct integration with NSE APIs
+        
+        ### Quick Start:
+        1. Enter a ticker symbol (e.g., RELIANCE, TCS, INFY)
+        2. Click "🚀 Analyze Stock"
+        3. Wait 10-20 seconds for data to load
+        4. Explore the comprehensive analysis!
+        
+        ### Popular Stocks to Try:
+        - **RELIANCE** - Reliance Industries (Large Cap)
+        - **TCS** - Tata Consultancy Services (IT)
+        - **INFY** - Infosys (IT)
+        - **HDFCBANK** - HDFC Bank (Banking)
+        - **ICICIBANK** - ICICI Bank (Banking)
+        
+        ---
+        
+        ⚠️ **Note on Rate Limiting**: 
+        This app uses free data APIs which may have rate limits. If you encounter errors, 
+        wait 2-3 minutes before retrying. Once data is loaded, it's cached for 1 hour.
+        """)
     
     # Footer
     st.markdown("---")
