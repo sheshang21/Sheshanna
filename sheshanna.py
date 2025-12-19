@@ -8,7 +8,9 @@ from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 import warnings
+import json
 import time
+import re
 warnings.filterwarnings('ignore')
 
 # Statistical and ML imports
@@ -25,6 +27,28 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# NSE Headers and Session Management
+def create_nse_session():
+    """Create a session with NSE-compatible headers"""
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'DNT': '1',
+        'Referer': 'https://www.nseindia.com/'
+    }
+    session.headers.update(headers)
+    # Get cookies by visiting the homepage
+    try:
+        session.get('https://www.nseindia.com', timeout=10)
+        time.sleep(1)  # Small delay to let cookies set
+    except:
+        pass
+    return session
 
 # Custom CSS
 st.markdown("""
@@ -49,83 +73,134 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Helper Functions
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_stock_data(ticker):
-    """Fetch stock data from Yahoo Finance with retry logic"""
+def calculate_beta_vs_nifty(stock_data, ticker):
+    """Calculate beta of stock vs Nifty 50"""
     try:
-        # Add .NS suffix for NSE stocks
+        # Get Nifty 50 data
+        nifty = yf.Ticker("^NSEI")
+        nifty_data = nifty.history(period="1y")
+        
+        if len(nifty_data) == 0:
+            return None
+        
+        # Align dates
+        stock_returns = stock_data['Close'].pct_change().dropna()
+        nifty_returns = nifty_data['Close'].pct_change().dropna()
+        
+        # Get common dates
+        common_dates = stock_returns.index.intersection(nifty_returns.index)
+        
+        if len(common_dates) < 30:  # Need at least 30 data points
+            return None
+        
+        stock_returns = stock_returns.loc[common_dates]
+        nifty_returns = nifty_returns.loc[common_dates]
+        
+        # Calculate beta using covariance method
+        covariance = np.cov(stock_returns, nifty_returns)[0][1]
+        variance = np.var(nifty_returns)
+        
+        beta = covariance / variance if variance != 0 else None
+        
+        return beta
+    except Exception as e:
+        st.warning(f"Could not calculate beta: {e}")
+        return None
+
+@st.cache_data(ttl=3600)
+def scrape_nse_stock_info(symbol):
+    """Scrape detailed stock information from NSE"""
+    try:
+        session = create_nse_session()
+        
+        # Quote API
+        quote_url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+        response = session.get(quote_url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        return None
+    except Exception as e:
+        st.warning(f"NSE data fetch error: {e}")
+        return None
+
+@st.cache_data(ttl=3600)
+def get_nse_corporate_actions(symbol):
+    """Get corporate actions from NSE"""
+    try:
+        session = create_nse_session()
+        
+        # Corporate actions API
+        url = f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={symbol}"
+        response = session.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        return None
+    except Exception as e:
+        return None
+
+@st.cache_data(ttl=3600)
+def get_nse_shareholding(symbol):
+    """Get shareholding pattern from NSE"""
+    try:
+        session = create_nse_session()
+        
+        # Shareholding pattern API
+        url = f"https://www.nseindia.com/api/corporates-shareholding-pattern?symbol={symbol}"
+        response = session.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        return None
+    except Exception as e:
+        return None
+
+@st.cache_data(ttl=3600)
+def get_stock_data(ticker):
+    """Fetch stock data from Yahoo Finance and NSE"""
+    try:
+        # Store original ticker for NSE
+        nse_symbol = ticker.upper()
+        
+        # Add .NS suffix for NSE stocks if not present
         if not ticker.endswith('.NS'):
             ticker = ticker + '.NS'
         
-        # Add retry logic with exponential backoff
-        max_retries = 3
-        retry_delay = 3
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="max")
+        info = stock.info
         
-        for attempt in range(max_retries):
-            try:
-                # Method 1: Use yf.download (more reliable for historical data)
-                with st.spinner(f"Fetching data for {ticker}... (Attempt {attempt + 1}/{max_retries})"):
-                    # Add delay to avoid rate limiting
-                    if attempt > 0:
-                        time.sleep(retry_delay * attempt)
-                    
-                    # Download historical data
-                    data = yf.download(ticker, period="max", progress=False, show_errors=False)
-                    
-                    if data is None or len(data) == 0:
-                        if attempt < max_retries - 1:
-                            time.sleep(retry_delay)
-                            continue
-                        else:
-                            st.error("No historical data available for this ticker.")
-                            return None, None, None
-                    
-                    # Get company info separately
-                    time.sleep(1)  # Small delay between requests
-                    stock = yf.Ticker(ticker)
-                    info = stock.info
-                    
-                    # If info is empty, create a minimal info dict
-                    if not info or len(info) == 0:
-                        info = {
-                            'longName': ticker.replace('.NS', ''),
-                            'symbol': ticker
-                        }
-                    
-                    return data, info, ticker
-                    
-            except Exception as e:
-                error_msg = str(e)
-                if "Rate limited" in error_msg or "Too Many Requests" in error_msg or "429" in error_msg:
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
-                        st.warning(f"⏳ Rate limited. Waiting {wait_time} seconds before retry...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        st.error("⚠️ **Yahoo Finance Rate Limit Reached**")
-                        st.info("📌 **Solutions:**\n"
-                                "1. Wait 2-5 minutes before trying again\n"
-                                "2. Clear Streamlit cache: Click ⋮ menu → Clear cache → Rerun\n"
-                                "3. Try a different ticker\n"
-                                "4. Restart the application\n\n"
-                                "Yahoo Finance has strict rate limits. This is normal and temporary.")
-                        return None, None, None
-                else:
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        raise e
-                    
+        # Convert data to dict for serialization
+        data_dict = {
+            'data': data.to_dict(),
+            'index': data.index.tolist()
+        }
+        
+        # Calculate proper beta vs Nifty 50
+        if data is not None and len(data) > 0:
+            calculated_beta = calculate_beta_vs_nifty(data, ticker)
+            if calculated_beta is not None:
+                info['calculatedBeta'] = calculated_beta
+        
+        # Get NSE data
+        nse_data = scrape_nse_stock_info(nse_symbol)
+        
+        return data_dict, info, nse_data, nse_symbol
     except Exception as e:
-        st.error(f"❌ Error fetching data: {e}")
-        st.info("💡 **Troubleshooting:**\n"
-                "- Verify ticker symbol (e.g., RELIANCE, TCS, INFY)\n"
-                "- Ensure stock is listed on NSE\n"
-                "- Wait a few minutes if rate limited\n"
-                "- Try clearing cache: ⋮ menu → Clear cache")
-        return None, None, None
+        st.error(f"Error fetching data: {e}")
+        return None, None, None, None
+
+def reconstruct_dataframe(data_dict):
+    """Reconstruct pandas DataFrame from cached dict"""
+    if data_dict is None:
+        return None
+    df = pd.DataFrame(data_dict['data'])
+    df.index = pd.DatetimeIndex(data_dict['index'])
+    return df
 
 def identify_major_fluctuations(data, threshold=5):
     """Identify major price fluctuations (peaks and troughs)"""
@@ -320,29 +395,65 @@ def forecast_prices(data, periods=30):
     future_X = np.arange(len(prices), len(prices) + periods).reshape(-1, 1)
     lr_forecast = lr_model.predict(future_X)
     
-    # Method 2: ARIMA (simplified)
+    # Method 2: ARIMA (simplified with error handling)
     try:
-        arima_model = ARIMA(prices, order=(5, 1, 0))
+        # Use auto-selection for ARIMA parameters
+        arima_model = ARIMA(prices[-252:], order=(2, 1, 2))  # Use last year of data
         arima_fit = arima_model.fit()
         arima_forecast = arima_fit.forecast(steps=periods)
-    except:
+    except Exception as e:
+        st.warning(f"ARIMA model failed, using linear regression backup: {str(e)[:100]}")
         arima_forecast = lr_forecast
     
-    # Method 3: Exponential Smoothing
+    # Method 3: Exponential Smoothing (with better error handling)
     try:
-        es_model = ExponentialSmoothing(prices, trend='add', seasonal=None)
+        # Use last 252 trading days (1 year)
+        recent_prices = prices[-252:] if len(prices) > 252 else prices
+        es_model = ExponentialSmoothing(
+            recent_prices, 
+            trend='add', 
+            seasonal=None,
+            initialization_method="estimated"
+        )
         es_fit = es_model.fit()
         es_forecast = es_fit.forecast(steps=periods)
-    except:
+    except Exception as e:
+        st.warning(f"Exponential Smoothing failed, using linear regression backup: {str(e)[:100]}")
         es_forecast = lr_forecast
     
-    # Ensemble forecast (average of methods)
-    ensemble_forecast = (lr_forecast + arima_forecast + es_forecast) / 3
+    # Method 4: Moving Average Forecast
+    try:
+        ma_window = min(30, len(prices) // 4)  # Adaptive window
+        ma_values = np.convolve(prices, np.ones(ma_window)/ma_window, mode='valid')
+        recent_trend = ma_values[-1] - ma_values[-ma_window] if len(ma_values) >= ma_window else 0
+        ma_forecast = np.array([prices[-1] + recent_trend * i for i in range(1, periods + 1)])
+    except:
+        ma_forecast = lr_forecast
     
-    # Calculate confidence intervals
-    std_dev = np.std(prices[-30:])
-    upper_bound = ensemble_forecast + 1.96 * std_dev
-    lower_bound = ensemble_forecast - 1.96 * std_dev
+    # Ensemble forecast (weighted average of methods)
+    # Weight more recent/reliable methods higher
+    try:
+        ensemble_forecast = (
+            0.25 * lr_forecast + 
+            0.35 * arima_forecast + 
+            0.30 * es_forecast + 
+            0.10 * ma_forecast
+        )
+    except:
+        ensemble_forecast = lr_forecast
+    
+    # Calculate confidence intervals based on historical volatility
+    returns = np.diff(prices) / prices[:-1]
+    std_dev = np.std(returns) * np.sqrt(periods)  # Scale by time horizon
+    mean_price = np.mean(ensemble_forecast)
+    
+    # Widen confidence intervals over time
+    time_factors = np.sqrt(np.arange(1, periods + 1))
+    upper_bound = ensemble_forecast + 1.96 * std_dev * mean_price * time_factors / np.sqrt(periods)
+    lower_bound = ensemble_forecast - 1.96 * std_dev * mean_price * time_factors / np.sqrt(periods)
+    
+    # Ensure lower bound doesn't go negative
+    lower_bound = np.maximum(lower_bound, ensemble_forecast * 0.5)
     
     forecast_dates = pd.date_range(start=data.index[-1] + timedelta(days=1), periods=periods, freq='D')
     
@@ -353,7 +464,8 @@ def forecast_prices(data, periods=30):
         'Lower Bound': lower_bound,
         'Linear Regression': lr_forecast,
         'ARIMA': arima_forecast,
-        'Exponential Smoothing': es_forecast
+        'Exponential Smoothing': es_forecast,
+        'Moving Average': ma_forecast
     })
     
     return forecast_df, ensemble_forecast
@@ -362,25 +474,17 @@ def forecast_prices(data, periods=30):
 def scrape_fii_dii_data():
     """Scrape FII/DII data from NSE"""
     try:
-        url = "https://www.nseindia.com/api/fiidiiTrading?index=fii"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
+        session = create_nse_session()
         
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers)
-        
-        response = session.get(url, headers=headers, timeout=10)
+        # FII DII Trading data
+        url = "https://www.nseindia.com/api/fiidiiTrading?index=equities"
+        response = session.get(url, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
             return data
-        else:
-            return None
+        return None
     except Exception as e:
-        st.warning(f"Could not fetch FII/DII data: {e}")
         return None
 
 @st.cache_data(ttl=3600)
@@ -389,7 +493,7 @@ def get_company_news(company_name, ticker):
     news_items = []
     
     try:
-        # Recreate Yahoo Finance ticker object
+        # Yahoo Finance news - create fresh ticker object
         stock = yf.Ticker(ticker)
         yf_news = stock.news
         
@@ -401,7 +505,7 @@ def get_company_news(company_name, ticker):
                 'date': datetime.fromtimestamp(item.get('providerPublishTime', 0)).strftime('%Y-%m-%d')
             })
     except Exception as e:
-        st.warning(f"Could not fetch news: {e}")
+        pass  # Silently handle news fetch errors
     
     return news_items
 
@@ -454,7 +558,11 @@ def get_valuation_metrics(info, current_price):
     # Market metrics
     metrics['Market Cap'] = info.get('marketCap', 'N/A')
     metrics['Enterprise Value'] = info.get('enterpriseValue', 'N/A')
-    metrics['Beta'] = info.get('beta', 'N/A')
+    
+    # Use calculated beta vs Nifty 50 if available
+    metrics['Beta (vs Nifty 50)'] = info.get('calculatedBeta', info.get('beta', 'N/A'))
+    if metrics['Beta (vs Nifty 50)'] != 'N/A' and metrics['Beta (vs Nifty 50)'] is not None:
+        metrics['Beta (vs Nifty 50)'] = round(metrics['Beta (vs Nifty 50)'], 3)
     
     return metrics
 
@@ -492,6 +600,16 @@ def interpret_valuation(metrics):
         else:
             interpretations.append("⭐ **Low ROE**: Company may struggle with profitability.")
     
+    # Beta interpretation
+    beta = metrics.get('Beta (vs Nifty 50)', 'N/A')
+    if beta != 'N/A' and beta is not None:
+        if beta > 1.2:
+            interpretations.append("📊 **High Beta**: Stock is more volatile than Nifty 50, higher risk but potential for higher returns.")
+        elif beta > 0.8:
+            interpretations.append("📊 **Moderate Beta**: Stock moves roughly in line with Nifty 50.")
+        else:
+            interpretations.append("📊 **Low Beta**: Stock is less volatile than Nifty 50, more defensive.")
+    
     # Dividend interpretation
     div_yield = metrics.get('Dividend Yield (%)', 'N/A')
     if div_yield != 'N/A' and div_yield is not None and div_yield > 0:
@@ -524,23 +642,42 @@ def main():
         forecast_days = st.slider("Forecast Period (Days)", 7, 90, 30)
         
         st.markdown("---")
-        st.info("💡 **Rate Limit Info**\n\nYahoo Finance has rate limits. If you get errors:\n- Wait 2-5 minutes\n- Click ⋮ → Clear cache\n- Try different ticker")
-        
-        st.markdown("---")
         analyze_button = st.button("🚀 Analyze Stock", type="primary")
     
     if analyze_button and ticker_input:
         ticker = ticker_input.strip().upper()
         
-        data, info, ticker_full = get_stock_data(ticker)
+        with st.spinner(f"Fetching data for {ticker}..."):
+            data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
         
-        if data is not None and len(data) > 0 and info:
+        if data_dict is not None and info:
+            # Reconstruct DataFrame from cached dict
+            data = reconstruct_dataframe(data_dict)
+            
+            if data is None or len(data) == 0:
+                st.error(f"❌ No historical data available for ticker '{ticker}'.")
+                return
+            
             # Company Header
             company_name = info.get('longName', ticker)
             current_price = data['Close'].iloc[-1]
             prev_close = data['Close'].iloc[-2] if len(data) > 1 else current_price
             change = current_price - prev_close
             change_pct = (change / prev_close) * 100
+            
+            # Show NSE data if available
+            if nse_data:
+                st.success("✅ NSE Data Retrieved Successfully")
+                with st.expander("📊 View NSE Live Data"):
+                    try:
+                        nse_info = nse_data.get('priceInfo', {})
+                        st.write(f"**Last Price (NSE):** ₹{nse_info.get('lastPrice', 'N/A')}")
+                        st.write(f"**Change:** ₹{nse_info.get('change', 'N/A')} ({nse_info.get('pChange', 'N/A')}%)")
+                        st.write(f"**52W High:** ₹{nse_info.get('weekHighLow', {}).get('max', 'N/A')}")
+                        st.write(f"**52W Low:** ₹{nse_info.get('weekHighLow', {}).get('min', 'N/A')}")
+                        st.write(f"**Total Traded Volume:** {nse_data.get('securityWiseDP', {}).get('quantityTraded', 'N/A'):,}")
+                    except:
+                        st.json(nse_data)
             
             col1, col2, col3, col4 = st.columns(4)
             
@@ -568,7 +705,12 @@ def main():
                 else:
                     st.write("**Market Cap:**", 'N/A')
             with col3:
-                st.write("**Beta:**", round(info.get('beta', 0), 2))
+                # Show calculated beta vs Nifty 50
+                calc_beta = info.get('calculatedBeta', info.get('beta', 'N/A'))
+                if calc_beta != 'N/A' and calc_beta is not None:
+                    st.write("**Beta (vs Nifty 50):**", f"{calc_beta:.3f}")
+                else:
+                    st.write("**Beta:**", 'N/A')
                 st.write("**Volume:**", f"{info.get('volume', 'N/A'):,}")
             with col4:
                 st.write("**Avg Volume:**", f"{info.get('averageVolume', 'N/A'):,}")
@@ -732,7 +874,7 @@ def main():
                     else:
                         st.write(f"**Enterprise Value:** N/A")
                     
-                    st.write(f"**Beta:** {valuation_metrics['Beta']}")
+                    st.write(f"**Beta (vs Nifty 50):** {valuation_metrics['Beta (vs Nifty 50)']}")
                 
                 st.markdown("---")
                 st.subheader("📊 Valuation Interpretations")
@@ -833,20 +975,48 @@ def main():
                     with st.expander("📋 View Detailed Forecast Data"):
                         display_df = forecast_df.copy()
                         display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
-                        for col in ['Forecast', 'Upper Bound', 'Lower Bound', 'Linear Regression', 'ARIMA', 'Exponential Smoothing']:
-                            display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}")
+                        for col in ['Forecast', 'Upper Bound', 'Lower Bound', 'Linear Regression', 'ARIMA', 'Exponential Smoothing', 'Moving Average']:
+                            if col in display_df.columns:
+                                display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}")
                         st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    
+                    # Model comparison
+                    with st.expander("🔬 View Model Comparison"):
+                        st.markdown("### Individual Model Forecasts")
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            lr_final = forecast_df['Linear Regression'].iloc[-1]
+                            lr_change = ((lr_final - current_price) / current_price) * 100
+                            st.metric("Linear Regression", f"₹{lr_final:.2f}", f"{lr_change:.2f}%")
+                        
+                        with col2:
+                            arima_final = forecast_df['ARIMA'].iloc[-1]
+                            arima_change = ((arima_final - current_price) / current_price) * 100
+                            st.metric("ARIMA", f"₹{arima_final:.2f}", f"{arima_change:.2f}%")
+                        
+                        with col3:
+                            es_final = forecast_df['Exponential Smoothing'].iloc[-1]
+                            es_change = ((es_final - current_price) / current_price) * 100
+                            st.metric("Exp. Smoothing", f"₹{es_final:.2f}", f"{es_change:.2f}%")
+                        
+                        with col4:
+                            ma_final = forecast_df['Moving Average'].iloc[-1]
+                            ma_change = ((ma_final - current_price) / current_price) * 100
+                            st.metric("Moving Average", f"₹{ma_final:.2f}", f"{ma_change:.2f}%")
+                        
+                        st.info("**Ensemble Forecast** combines all models with weighted averaging for better accuracy.")
             
             # News & Events Section
             if show_news:
                 st.markdown("---")
                 st.subheader("📰 News & Market Events")
                 
-                tab1, tab2, tab3 = st.tabs(["📰 Latest News", "🏦 FII/DII Data", "📊 Corporate Actions"])
+                tab1, tab2, tab3, tab4 = st.tabs(["📰 Latest News", "🏦 FII/DII Data", "📊 Corporate Actions", "👥 Shareholding Pattern"])
                 
                 with tab1:
                     st.markdown("### Latest News Articles")
-                    news_items = get_company_news(company_name, ticker_full)
+                    news_items = get_company_news(company_name, ticker + '.NS')
                     
                     if news_items:
                         for item in news_items:
@@ -859,12 +1029,21 @@ def main():
                         st.info("No recent news available.")
                 
                 with tab2:
-                    st.markdown("### FII/DII Inflows (Last 5 Days)")
+                    st.markdown("### FII/DII Inflows")
                     fii_data = scrape_fii_dii_data()
                     
                     if fii_data:
-                        st.write("FII/DII data fetched from NSE")
-                        st.json(fii_data)
+                        st.success("✅ FII/DII data fetched from NSE")
+                        
+                        # Try to parse and display in a nice format
+                        try:
+                            if 'data' in fii_data:
+                                df = pd.DataFrame(fii_data['data'])
+                                st.dataframe(df, use_container_width=True)
+                            else:
+                                st.json(fii_data)
+                        except:
+                            st.json(fii_data)
                     else:
                         st.info("FII/DII data not available. This data requires NSE API access with proper authentication.")
                         st.markdown("""
@@ -879,19 +1058,65 @@ def main():
                 with tab3:
                     st.markdown("### Corporate Actions & Announcements")
                     
-                    # Dividend info
+                    # Get corporate actions from NSE
+                    corp_actions = get_nse_corporate_actions(nse_symbol)
+                    
+                    if corp_actions:
+                        st.success("✅ Corporate actions data fetched from NSE")
+                        try:
+                            if isinstance(corp_actions, list):
+                                df = pd.DataFrame(corp_actions)
+                                st.dataframe(df, use_container_width=True)
+                            else:
+                                st.json(corp_actions)
+                        except:
+                            st.json(corp_actions)
+                    
+                    # Dividend info from Yahoo Finance
+                    st.markdown("---")
+                    st.markdown("### Dividend Information")
                     if info.get('dividendRate'):
                         st.success(f"💵 **Dividend**: ₹{info.get('dividendRate', 'N/A')} per share")
                         st.write(f"**Dividend Yield**: {info.get('dividendYield', 'N/A')}%")
                         st.write(f"**Ex-Dividend Date**: {info.get('exDividendDate', 'N/A')}")
+                    else:
+                        st.info("No dividend information available")
                     
                     # Earnings date
                     if info.get('earningsDate'):
                         st.info(f"📅 **Next Earnings Date**: {info.get('earningsDate', 'N/A')}")
                     
-                    # Other corporate actions
-                    st.markdown("**Recent Corporate Actions**")
-                    st.info("For detailed corporate action history, visit: https://www.bseindia.com/corporates/corporates_act.aspx")
+                    if not corp_actions:
+                        st.info("For detailed corporate action history, visit: https://www.bseindia.com/corporates/corporates_act.aspx")
+                
+                with tab4:
+                    st.markdown("### Shareholding Pattern")
+                    
+                    shareholding = get_nse_shareholding(nse_symbol)
+                    
+                    if shareholding:
+                        st.success("✅ Shareholding data fetched from NSE")
+                        try:
+                            # Display shareholding data
+                            if 'data' in shareholding:
+                                for category, details in shareholding['data'].items():
+                                    st.subheader(category.replace('_', ' ').title())
+                                    if isinstance(details, list) and len(details) > 0:
+                                        df = pd.DataFrame(details)
+                                        st.dataframe(df, use_container_width=True)
+                                    elif isinstance(details, dict):
+                                        st.json(details)
+                            else:
+                                st.json(shareholding)
+                        except Exception as e:
+                            st.json(shareholding)
+                    else:
+                        st.info("Shareholding pattern data not available from NSE API")
+                        st.markdown("""
+                        **Note**: You can check shareholding patterns at:
+                        - NSE: https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern
+                        - BSE: https://www.bseindia.com/corporates/shpPromoterNGroup.aspx
+                        """)
         
         else:
             st.error(f"❌ Could not fetch data for ticker '{ticker}'. Please verify the ticker symbol is correct and listed on NSE.")
