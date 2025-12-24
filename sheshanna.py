@@ -380,82 +380,172 @@ def interpret_statistics(stats_dict, current_price):
     return interpretations
 
 def forecast_prices(data, periods=30):
-    """Forecast future prices using multiple methods"""
+    """Forecast future prices using multiple improved methods"""
     if data is None or len(data) < 50:
         return None, None
     
     prices = data['Close'].values
-    
-    # Method 1: Linear Regression
-    X = np.arange(len(prices)).reshape(-1, 1)
-    y = prices
-    lr_model = LinearRegression()
-    lr_model.fit(X, y)
-    
-    future_X = np.arange(len(prices), len(prices) + periods).reshape(-1, 1)
-    lr_forecast = lr_model.predict(future_X)
-    
-    # Method 2: ARIMA (simplified with error handling)
-    try:
-        # Use auto-selection for ARIMA parameters
-        arima_model = ARIMA(prices[-252:], order=(2, 1, 2))  # Use last year of data
-        arima_fit = arima_model.fit()
-        arima_forecast = arima_fit.forecast(steps=periods)
-    except Exception as e:
-        st.warning(f"ARIMA model failed, using linear regression backup: {str(e)[:100]}")
-        arima_forecast = lr_forecast
-    
-    # Method 3: Exponential Smoothing (with better error handling)
-    try:
-        # Use last 252 trading days (1 year)
-        recent_prices = prices[-252:] if len(prices) > 252 else prices
-        es_model = ExponentialSmoothing(
-            recent_prices, 
-            trend='add', 
-            seasonal=None,
-            initialization_method="estimated"
-        )
-        es_fit = es_model.fit()
-        es_forecast = es_fit.forecast(steps=periods)
-    except Exception as e:
-        st.warning(f"Exponential Smoothing failed, using linear regression backup: {str(e)[:100]}")
-        es_forecast = lr_forecast
-    
-    # Method 4: Moving Average Forecast
-    try:
-        ma_window = min(30, len(prices) // 4)  # Adaptive window
-        ma_values = np.convolve(prices, np.ones(ma_window)/ma_window, mode='valid')
-        recent_trend = ma_values[-1] - ma_values[-ma_window] if len(ma_values) >= ma_window else 0
-        ma_forecast = np.array([prices[-1] + recent_trend * i for i in range(1, periods + 1)])
-    except:
-        ma_forecast = lr_forecast
-    
-    # Ensemble forecast (weighted average of methods)
-    # Weight more recent/reliable methods higher
-    try:
-        ensemble_forecast = (
-            0.25 * lr_forecast + 
-            0.35 * arima_forecast + 
-            0.30 * es_forecast + 
-            0.10 * ma_forecast
-        )
-    except:
-        ensemble_forecast = lr_forecast
-    
-    # Calculate confidence intervals based on historical volatility
     returns = np.diff(prices) / prices[:-1]
-    std_dev = np.std(returns) * np.sqrt(periods)  # Scale by time horizon
-    mean_price = np.mean(ensemble_forecast)
     
-    # Widen confidence intervals over time
-    time_factors = np.sqrt(np.arange(1, periods + 1))
-    upper_bound = ensemble_forecast + 1.96 * std_dev * mean_price * time_factors / np.sqrt(periods)
-    lower_bound = ensemble_forecast - 1.96 * std_dev * mean_price * time_factors / np.sqrt(periods)
+    # Use more recent data for better predictions (last 252 trading days = 1 year)
+    recent_prices = prices[-min(252, len(prices)):]
     
-    # Ensure lower bound doesn't go negative
-    lower_bound = np.maximum(lower_bound, ensemble_forecast * 0.5)
+    try:
+        # Method 1: Linear Regression with Recent Trend
+        lookback = min(60, len(recent_prices))  # Last 60 days for trend
+        X = np.arange(lookback).reshape(-1, 1)
+        y = recent_prices[-lookback:]
+        lr_model = LinearRegression()
+        lr_model.fit(X, y)
+        
+        future_X = np.arange(lookback, lookback + periods).reshape(-1, 1)
+        lr_forecast = lr_model.predict(future_X)
+        
+        # Constrain linear regression to reasonable bounds
+        lr_forecast = np.clip(lr_forecast, recent_prices[-1] * 0.5, recent_prices[-1] * 2.0)
+        
+    except Exception as e:
+        st.warning(f"Linear Regression failed: {str(e)[:50]}")
+        lr_forecast = np.array([recent_prices[-1]] * periods)
     
-    forecast_dates = pd.date_range(start=data.index[-1] + timedelta(days=1), periods=periods, freq='D')
+    try:
+        # Method 2: Improved ARIMA
+        # Use log prices for better stability
+        log_prices = np.log(recent_prices)
+        
+        # Fit ARIMA with conservative parameters
+        arima_model = ARIMA(log_prices, order=(1, 1, 1))
+        arima_fit = arima_model.fit()
+        
+        # Forecast in log space
+        log_forecast = arima_fit.forecast(steps=periods)
+        
+        # Convert back to price space
+        arima_forecast = np.exp(log_forecast)
+        
+        # Constrain to reasonable bounds
+        arima_forecast = np.clip(arima_forecast, recent_prices[-1] * 0.5, recent_prices[-1] * 2.0)
+        
+    except Exception as e:
+        st.warning(f"ARIMA failed, using momentum model: {str(e)[:50]}")
+        # Fallback: Simple momentum model
+        momentum = (recent_prices[-1] - recent_prices[-min(20, len(recent_prices))]) / min(20, len(recent_prices))
+        arima_forecast = np.array([recent_prices[-1] + momentum * i for i in range(1, periods + 1)])
+        arima_forecast = np.clip(arima_forecast, recent_prices[-1] * 0.5, recent_prices[-1] * 2.0)
+    
+    try:
+        # Method 3: Exponential Smoothing (Holt's method - trend only, no seasonality)
+        from statsmodels.tsa.holtwinters import Holt
+        
+        # Use Holt's linear method (simpler, more stable)
+        holt_model = Holt(recent_prices, initialization_method="estimated")
+        holt_fit = holt_model.fit(smoothing_level=0.8, smoothing_trend=0.2, optimized=False)
+        es_forecast = holt_fit.forecast(steps=periods)
+        
+        # Constrain to reasonable bounds
+        es_forecast = np.clip(es_forecast, recent_prices[-1] * 0.5, recent_prices[-1] * 2.0)
+        
+    except Exception as e:
+        st.warning(f"Exponential Smoothing failed, using weighted MA: {str(e)[:50]}")
+        # Fallback: Exponentially weighted moving average
+        weights = np.exp(np.linspace(-1, 0, min(20, len(recent_prices))))
+        weights /= weights.sum()
+        weighted_avg = np.average(recent_prices[-len(weights):], weights=weights)
+        trend = (recent_prices[-1] - recent_prices[-min(10, len(recent_prices))]) / min(10, len(recent_prices))
+        es_forecast = np.array([weighted_avg + trend * i for i in range(1, periods + 1)])
+        es_forecast = np.clip(es_forecast, recent_prices[-1] * 0.5, recent_prices[-1] * 2.0)
+    
+    try:
+        # Method 4: Adaptive Moving Average with Mean Reversion
+        ma_short = np.mean(recent_prices[-min(10, len(recent_prices)):])
+        ma_long = np.mean(recent_prices[-min(50, len(recent_prices)):])
+        
+        # Calculate momentum
+        momentum = ma_short - ma_long
+        
+        # Mean reversion factor (decay momentum over time)
+        decay_factor = 0.95
+        ma_forecast = []
+        current_price = recent_prices[-1]
+        
+        for i in range(periods):
+            # Apply decaying momentum and mean revert to long-term average
+            reversion = (ma_long - current_price) * 0.01  # Small mean reversion
+            next_price = current_price + momentum * (decay_factor ** i) + reversion
+            ma_forecast.append(next_price)
+            current_price = next_price
+        
+        ma_forecast = np.array(ma_forecast)
+        ma_forecast = np.clip(ma_forecast, recent_prices[-1] * 0.5, recent_prices[-1] * 2.0)
+        
+    except Exception as e:
+        st.warning(f"Moving Average failed: {str(e)[:50]}")
+        ma_forecast = lr_forecast.copy()
+    
+    # Ensemble forecast with adaptive weights
+    # Give more weight to models that are closer to current price
+    try:
+        # Calculate model weights based on their starting predictions
+        lr_weight = 1.0 / (1.0 + abs(lr_forecast[0] - recent_prices[-1]) / recent_prices[-1])
+        arima_weight = 1.0 / (1.0 + abs(arima_forecast[0] - recent_prices[-1]) / recent_prices[-1])
+        es_weight = 1.0 / (1.0 + abs(es_forecast[0] - recent_prices[-1]) / recent_prices[-1])
+        ma_weight = 1.0 / (1.0 + abs(ma_forecast[0] - recent_prices[-1]) / recent_prices[-1])
+        
+        # Normalize weights
+        total_weight = lr_weight + arima_weight + es_weight + ma_weight
+        lr_weight /= total_weight
+        arima_weight /= total_weight
+        es_weight /= total_weight
+        ma_weight /= total_weight
+        
+        # Weighted ensemble
+        ensemble_forecast = (
+            lr_weight * lr_forecast +
+            arima_weight * arima_forecast +
+            es_weight * es_forecast +
+            ma_weight * ma_forecast
+        )
+        
+        # Final safety constraint
+        ensemble_forecast = np.clip(ensemble_forecast, recent_prices[-1] * 0.3, recent_prices[-1] * 3.0)
+        
+    except Exception as e:
+        st.warning(f"Ensemble calculation failed: {str(e)[:50]}")
+        ensemble_forecast = lr_forecast.copy()
+    
+    # Calculate realistic confidence intervals
+    try:
+        # Use historical volatility
+        volatility = np.std(returns) if len(returns) > 0 else 0.02
+        
+        # Confidence intervals that widen over time (square root of time rule)
+        time_factors = np.sqrt(np.arange(1, periods + 1))
+        
+        # 95% confidence interval (1.96 standard deviations)
+        # Scale by current price level and time
+        std_dev_prices = volatility * ensemble_forecast
+        
+        upper_bound = ensemble_forecast * (1 + 1.96 * volatility * time_factors / np.sqrt(252))
+        lower_bound = ensemble_forecast * (1 - 1.96 * volatility * time_factors / np.sqrt(252))
+        
+        # Ensure bounds stay positive and reasonable
+        lower_bound = np.maximum(lower_bound, ensemble_forecast * 0.5)
+        lower_bound = np.maximum(lower_bound, recent_prices[-1] * 0.2)  # Never go below 20% of current
+        upper_bound = np.minimum(upper_bound, ensemble_forecast * 2.0)
+        
+    except Exception as e:
+        st.warning(f"Confidence interval calculation failed: {str(e)[:50]}")
+        # Simple symmetric bounds if calculation fails
+        bound_range = ensemble_forecast * 0.15  # +/- 15%
+        upper_bound = ensemble_forecast + bound_range
+        lower_bound = np.maximum(ensemble_forecast - bound_range, ensemble_forecast * 0.5)
+    
+    # Create forecast DataFrame
+    forecast_dates = pd.date_range(
+        start=data.index[-1] + timedelta(days=1), 
+        periods=periods, 
+        freq='D'
+    )
     
     forecast_df = pd.DataFrame({
         'Date': forecast_dates,
