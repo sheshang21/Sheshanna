@@ -108,39 +108,6 @@ def calculate_beta_vs_nifty(stock_data, ticker):
         st.warning(f"Could not calculate beta: {e}")
         return None
 
-def calculate_beta_vs_sensex(stock_data, ticker):
-    """Calculate beta of stock vs Sensex (for BSE stocks)"""
-    try:
-        # Get Sensex data
-        sensex = yf.Ticker("^BSESN")
-        sensex_data = sensex.history(period="1y")
-        
-        if len(sensex_data) == 0:
-            return None
-        
-        # Align dates
-        stock_returns = stock_data['Close'].pct_change().dropna()
-        sensex_returns = sensex_data['Close'].pct_change().dropna()
-        
-        # Get common dates
-        common_dates = stock_returns.index.intersection(sensex_returns.index)
-        
-        if len(common_dates) < 30:  # Need at least 30 data points
-            return None
-        
-        stock_returns = stock_returns.loc[common_dates]
-        sensex_returns = sensex_returns.loc[common_dates]
-        
-        # Calculate beta using covariance method
-        covariance = np.cov(stock_returns, sensex_returns)[0][1]
-        variance = np.var(sensex_returns)
-        
-        beta = covariance / variance if variance != 0 else None
-        
-        return beta
-    except Exception as e:
-        return None
-
 @st.cache_data(ttl=3600)
 def scrape_nse_stock_info(symbol):
     """Scrape detailed stock information from NSE"""
@@ -195,51 +162,18 @@ def get_nse_shareholding(symbol):
 
 @st.cache_data(ttl=3600)
 def get_stock_data(ticker):
-    """Fetch stock data from Yahoo Finance - supports both NSE and BSE with retry logic"""
-    max_retries = 3
-    retry_delay = 1
-    
-    for attempt in range(max_retries):
-        try:
-            # Determine exchange from ticker
-            if ticker.endswith('.NS'):
-                exchange = 'NSE'
-                nse_symbol = ticker.replace('.NS', '').upper()
-            elif ticker.endswith('.BO'):
-                exchange = 'BSE'
-                nse_symbol = None  # BSE stocks don't have NSE data
-            else:
-                # If no suffix, default to NSE
-                exchange = 'NSE'
-                ticker = ticker + '.NS'
-                nse_symbol = ticker.replace('.NS', '').upper()
-            
-            stock = yf.Ticker(ticker)
-            data = stock.history(period="max")
-            info = stock.info
-            
-            # If successful, break out of retry loop
-            if not data.empty and info:
-                break
-                
-        except Exception as e:
-            error_msg = str(e)
-            if "Too Many Requests" in error_msg or "Rate limited" in error_msg:
-                if attempt < max_retries - 1:
-                    # Exponential backoff
-                    wait_time = retry_delay * (2 ** attempt)
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    # Last attempt failed
-                    st.warning(f"⚠️ Rate limited on {ticker}. Skipping...")
-                    return None, None, None, None
-            else:
-                # Other error, don't retry
-                st.error(f"Error fetching data: {e}")
-                return None, None, None, None
-    
+    """Fetch stock data from Yahoo Finance and NSE"""
     try:
+        # Store original ticker for NSE
+        nse_symbol = ticker.upper()
+        
+        # Add .NS suffix for NSE stocks if not present
+        if not ticker.endswith('.NS'):
+            ticker = ticker + '.NS'
+        
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="max")
+        info = stock.info
         
         # Convert data to dict for serialization
         data_dict = {
@@ -247,22 +181,14 @@ def get_stock_data(ticker):
             'index': data.index.tolist()
         }
         
-        # Calculate proper beta vs appropriate index
+        # Calculate proper beta vs Nifty 50
         if data is not None and len(data) > 0:
-            if exchange == 'NSE':
-                # Compare with Nifty 50
-                calculated_beta = calculate_beta_vs_nifty(data, ticker)
-            else:
-                # For BSE, compare with Sensex
-                calculated_beta = calculate_beta_vs_sensex(data, ticker)
-            
+            calculated_beta = calculate_beta_vs_nifty(data, ticker)
             if calculated_beta is not None:
                 info['calculatedBeta'] = calculated_beta
         
-        # Get NSE-specific data only for NSE stocks
-        nse_data = None
-        if exchange == 'NSE' and nse_symbol:
-            nse_data = scrape_nse_stock_info(nse_symbol)
+        # Get NSE data
+        nse_data = scrape_nse_stock_info(nse_symbol)
         
         return data_dict, info, nse_data, nse_symbol
     except Exception as e:
@@ -807,9 +733,7 @@ def main():
         if exchange_mode == "NSE":
             try:
                 with open('nse.txt', 'r') as f:
-                    # Remove any existing .NS or .BO suffixes before loading
-                    available_stocks = [line.strip().upper().replace('.NS', '').replace('.BO', '') 
-                                      for line in f.readlines() if line.strip()]
+                    available_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
                 st.success(f"✅ Loaded {len(available_stocks)} NSE stocks")
                 exchange_suffix = ".NS"
                 st.session_state.exchange_suffix = ".NS"
@@ -817,13 +741,10 @@ def main():
                 st.error("⚠️ nse.txt not found")
                 available_stocks = []
                 exchange_suffix = ".NS"
-                st.session_state.exchange_suffix = ".NS"
         else:  # BSE
             try:
                 with open('bse.txt', 'r') as f:
-                    # Remove any existing .NS or .BO suffixes before loading
-                    available_stocks = [line.strip().upper().replace('.NS', '').replace('.BO', '')
-                                      for line in f.readlines() if line.strip()]
+                    available_stocks = [line.strip().upper() for line in f.readlines() if line.strip()]
                 st.success(f"✅ Loaded {len(available_stocks)} BSE stocks")
                 exchange_suffix = ".BO"
                 st.session_state.exchange_suffix = ".BO"
@@ -831,7 +752,6 @@ def main():
                 st.error("⚠️ bse.txt not found")
                 available_stocks = []
                 exchange_suffix = ".BO"
-                st.session_state.exchange_suffix = ".BO"
         
         st.markdown("---")
         
@@ -841,10 +761,10 @@ def main():
             help="Analyze one stock or scan multiple stocks in slots")
         
         if analysis_mode == "Single Stock":
-            suffix_to_use = st.session_state.get('exchange_suffix', '.NS')
             ticker_input = st.text_input(f"Enter {exchange_mode} Ticker Symbol", 
                 value="RELIANCE", 
-                help=f"Enter the {exchange_mode} ticker (without {suffix_to_use} suffix)")
+                help=f"Enter the {exchange_mode} ticker (without {exchange_suffix} suffix)")
+            suffix_to_use = st.session_state.get("exchange_suffix", ".NS")
             stocks_to_analyze = [ticker_input.strip().upper() + suffix_to_use] if ticker_input.strip() else []
         
         else:  # Slot-wise Analysis
@@ -889,37 +809,22 @@ def main():
                 
                 # Build stock list from selected slots
                 stocks_to_analyze = []
-                # Get exchange suffix from session state (persists across reruns)
-                suffix_to_use = st.session_state.get('exchange_suffix', '.NS')
-                
                 for slot_num in selected_slots:
                     start_idx = slot_num * slot_size
                     end_idx = min((slot_num + 1) * slot_size, total_stocks)
                     # Add exchange suffix to each stock
+                    suffix_to_use = st.session_state.get("exchange_suffix", ".NS")
                     stocks_to_analyze.extend([s + suffix_to_use for s in available_stocks[start_idx:end_idx]])
                 
                 if not selected_slots:
                     st.warning("⚠️ Select at least one slot")
                 else:
-                    # DEBUG: Show what we're actually scanning
+                    suffix_to_use = st.session_state.get("exchange_suffix", ".NS")
                     st.success(f"✅ {len(selected_slots)} slot(s) = {len(stocks_to_analyze)} stocks")
-                    st.info(f"🔍 DEBUG: Exchange suffix being used: **{suffix_to_use}**")
-                    st.info(f"🔍 DEBUG: First 3 tickers: {stocks_to_analyze[:3]}")
+                    st.info(f"🔍 Exchange suffix: **{suffix_to_use}** | Sample: {stocks_to_analyze[0] if stocks_to_analyze else 'N/A'}")
         
         st.markdown("---")
         st.header("⚙️ Analysis Options")
-        
-        # Add delay control for batch mode
-        if analysis_mode == "Slot-wise Analysis":
-            st.subheader("⏱️ Rate Limiting Control")
-            request_delay = st.slider("Delay between stocks (seconds)", 0.5, 3.0, 1.5, 0.1,
-                help="Higher delay = slower but avoids rate limiting. BSE needs higher delays.")
-            st.info(f"📊 Estimated time for 1000 stocks: ~{(request_delay * 1000 / 60):.0f} minutes")
-        else:
-            request_delay = 1.0
-        
-        st.markdown("---")
-        
         show_fluctuations = st.checkbox("Show Major Fluctuations", value=True)
         show_statistics = st.checkbox("Show Statistical Analysis", value=True)
         show_forecast = st.checkbox("Show Price Forecast", value=False)
@@ -937,499 +842,479 @@ def main():
             ticker = stocks_to_analyze[0].replace('.NS', '').replace('.BO', '')
             
             with st.spinner(f"Fetching data for {ticker}..."):
-                try:
-                    data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
-                except Exception as e:
-                    st.error(f"❌ Error fetching data: {str(e)}")
-                    data_dict = None
-                    info = None
+                data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
+        
+        if data_dict is not None and info:
+            # Reconstruct DataFrame from cached dict
+            data = reconstruct_dataframe(data_dict)
             
-            if data_dict is not None and info:
-                # Reconstruct DataFrame from cached dict
-                data = reconstruct_dataframe(data_dict)
-                
-                if data is None or len(data) == 0:
-                    st.error(f"❌ No historical data available for ticker '{ticker}'.")
+            if data is None or len(data) == 0:
+                st.error(f"❌ No historical data available for ticker '{ticker}'.")
+                return
+            
+            # Company Header
+            company_name = info.get('longName', ticker)
+            current_price = data['Close'].iloc[-1]
+            prev_close = data['Close'].iloc[-2] if len(data) > 1 else current_price
+            change = current_price - prev_close
+            change_pct = (change / prev_close) * 100
+            
+            # Show NSE data if available
+            if nse_data:
+                st.success("✅ NSE Data Retrieved Successfully")
+                with st.expander("📊 View NSE Live Data"):
+                    try:
+                        nse_info = nse_data.get('priceInfo', {})
+                        st.write(f"**Last Price (NSE):** ₹{nse_info.get('lastPrice', 'N/A')}")
+                        st.write(f"**Change:** ₹{nse_info.get('change', 'N/A')} ({nse_info.get('pChange', 'N/A')}%)")
+                        st.write(f"**52W High:** ₹{nse_info.get('weekHighLow', {}).get('max', 'N/A')}")
+                        st.write(f"**52W Low:** ₹{nse_info.get('weekHighLow', {}).get('min', 'N/A')}")
+                        st.write(f"**Total Traded Volume:** {nse_data.get('securityWiseDP', {}).get('quantityTraded', 'N/A'):,}")
+                    except:
+                        st.json(nse_data)
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Company", company_name)
+            with col2:
+                st.metric("Current Price", f"₹{current_price:.2f}", f"{change:.2f} ({change_pct:.2f}%)")
+            with col3:
+                st.metric("52W High", f"₹{info.get('fiftyTwoWeekHigh', 'N/A')}")
+            with col4:
+                st.metric("52W Low", f"₹{info.get('fiftyTwoWeekLow', 'N/A')}")
+            
+            # Key Information
+            st.markdown("---")
+            st.subheader("📋 Key Information")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.write("**Sector:**", info.get('sector', 'N/A'))
+                st.write("**Industry:**", info.get('industry', 'N/A'))
+            with col2:
+                market_cap = info.get('marketCap', 'N/A')
+                if market_cap != 'N/A':
+                    st.write("**Market Cap:**", f"₹{market_cap/10000000:.2f} Cr")
                 else:
-                    # Company Header
-                    company_name = info.get('longName', ticker)
-                    current_price = data['Close'].iloc[-1]
-                    prev_close = data['Close'].iloc[-2] if len(data) > 1 else current_price
-                    change = current_price - prev_close
-                    change_pct = (change / prev_close) * 100
-                    
-                    # Determine exchange
-                    exchange_name = "NSE" if '.NS' in stocks_to_analyze[0] else "BSE"
-                    exchange_emoji = "🔵" if exchange_name == "NSE" else "🟠"
-                    
-                    st.markdown(f"## {exchange_emoji} {company_name} ({exchange_name})")
+                    st.write("**Market Cap:**", 'N/A')
+            with col3:
+                # Show calculated beta vs Nifty 50
+                calc_beta = info.get('calculatedBeta', info.get('beta', 'N/A'))
+                if calc_beta != 'N/A' and calc_beta is not None:
+                    st.write("**Beta (vs Nifty 50):**", f"{calc_beta:.3f}")
+                else:
+                    st.write("**Beta:**", 'N/A')
+                st.write("**Volume:**", f"{info.get('volume', 'N/A'):,}")
+            with col4:
+                st.write("**Avg Volume:**", f"{info.get('averageVolume', 'N/A'):,}")
+                st.write("**Listing Date:**", data.index[0].strftime('%Y-%m-%d'))
             
-                    # Show NSE data if available (only for NSE stocks)
-                    if nse_data:
-                        st.success("✅ NSE Data Retrieved Successfully")
-                        with st.expander("📊 View NSE Live Data"):
-                            try:
-                                nse_info = nse_data.get('priceInfo', {})
-                                st.write(f"**Last Price (NSE):** ₹{nse_info.get('lastPrice', 'N/A')}")
-                                st.write(f"**Change:** ₹{nse_info.get('change', 'N/A')} ({nse_info.get('pChange', 'N/A')}%)")
-                                st.write(f"**52W High:** ₹{nse_info.get('weekHighLow', {}).get('max', 'N/A')}")
-                                st.write(f"**52W Low:** ₹{nse_info.get('weekHighLow', {}).get('min', 'N/A')}")
-                                st.write(f"**Total Traded Volume:** {nse_data.get('securityWiseDP', {}).get('quantityTraded', 'N/A'):,}")
-                            except:
-                                st.json(nse_data)
-            
-                col1, col2, col3, col4 = st.columns(4)
-            
-                with col1:
-                    st.metric("Company", company_name)
-                with col2:
-                    st.metric("Current Price", f"₹{current_price:.2f}", f"{change:.2f} ({change_pct:.2f}%)")
-                with col3:
-                    st.metric("52W High", f"₹{info.get('fiftyTwoWeekHigh', 'N/A')}")
-                with col4:
-                    st.metric("52W Low", f"₹{info.get('fiftyTwoWeekLow', 'N/A')}")
-            
-                # Key Information
+            # Major Fluctuations
+            if show_fluctuations:
                 st.markdown("---")
-                st.subheader("📋 Key Information")
-                col1, col2, col3, col4 = st.columns(4)
-            
-                with col1:
-                    st.write("**Sector:**", info.get('sector', 'N/A'))
-                    st.write("**Industry:**", info.get('industry', 'N/A'))
-                with col2:
-                    market_cap = info.get('marketCap', 'N/A')
-                    if market_cap != 'N/A':
-                        st.write("**Market Cap:**", f"₹{market_cap/10000000:.2f} Cr")
-                    else:
-                        st.write("**Market Cap:**", 'N/A')
-                with col3:
-                    # Show calculated beta vs appropriate index
-                    calc_beta = info.get('calculatedBeta', info.get('beta', 'N/A'))
-                    
-                    # Determine which index based on ticker
-                    ticker_symbol = stocks_to_analyze[0]
-                    if '.BO' in ticker_symbol:
-                        index_name = "Sensex"
-                    else:
-                        index_name = "Nifty 50"
-                    
-                    if calc_beta != 'N/A' and calc_beta is not None:
-                        st.write(f"**Beta (vs {index_name}):**", f"{calc_beta:.3f}")
-                    else:
-                        st.write("**Beta:**", 'N/A')
-                    st.write("**Volume:**", f"{info.get('volume', 'N/A'):,}")
-                with col4:
-                    st.write("**Avg Volume:**", f"{info.get('averageVolume', 'N/A'):,}")
-                    st.write("**Listing Date:**", data.index[0].strftime('%Y-%m-%d'))
-            
-                # Major Fluctuations
-                if show_fluctuations:
-                    st.markdown("---")
-                    st.subheader("📊 Major Price Fluctuations Analysis")
+                st.subheader("📊 Major Price Fluctuations Analysis")
                 
-                    fluctuations = identify_major_fluctuations(data, threshold=5)
+                fluctuations = identify_major_fluctuations(data, threshold=5)
                 
-                    if fluctuations:
-                        # Create visualization
-                        fig = go.Figure()
+                if fluctuations:
+                    # Create visualization
+                    fig = go.Figure()
                     
-                        # Price line
+                    # Price line
+                    fig.add_trace(go.Scatter(
+                        x=data.index,
+                        y=data['Close'],
+                        mode='lines',
+                        name='Close Price',
+                        line=dict(color='#1f77b4', width=2)
+                    ))
+                    
+                    # Mark fluctuations
+                    for fluct in fluctuations:
+                        color = 'red' if fluct['type'] == 'Trough' else 'green' if fluct['type'] == 'Peak' else 'blue'
                         fig.add_trace(go.Scatter(
-                            x=data.index,
-                            y=data['Close'],
-                            mode='lines',
-                            name='Close Price',
-                            line=dict(color='#1f77b4', width=2)
+                            x=[fluct['date']],
+                            y=[fluct['price']],
+                            mode='markers+text',
+                            name=fluct['type'],
+                            marker=dict(size=12, color=color),
+                            text=[f"{fluct['type']}<br>₹{fluct['price']:.2f}"],
+                            textposition="top center",
+                            showlegend=False
                         ))
                     
-                        # Mark fluctuations
-                        for fluct in fluctuations:
-                            color = 'red' if fluct['type'] == 'Trough' else 'green' if fluct['type'] == 'Peak' else 'blue'
-                            fig.add_trace(go.Scatter(
-                                x=[fluct['date']],
-                                y=[fluct['price']],
-                                mode='markers+text',
-                                name=fluct['type'],
-                                marker=dict(size=12, color=color),
-                                text=[f"{fluct['type']}<br>₹{fluct['price']:.2f}"],
-                                textposition="top center",
-                                showlegend=False
-                            ))
+                    fig.update_layout(
+                        title=f"{company_name} - Price History with Major Fluctuations",
+                        xaxis_title="Date",
+                        yaxis_title="Price (₹)",
+                        hovermode='x unified',
+                        height=500
+                    )
                     
-                        fig.update_layout(
-                            title=f"{company_name} - Price History with Major Fluctuations",
-                            xaxis_title="Date",
-                            yaxis_title="Price (₹)",
-                            hovermode='x unified',
-                            height=500
-                        )
+                    st.plotly_chart(fig, use_container_width=True)
                     
-                        st.plotly_chart(fig, use_container_width=True)
+                    # Fluctuations table
+                    st.subheader("📌 Identified Major Events")
+                    fluct_df = pd.DataFrame(fluctuations)
+                    fluct_df['date'] = fluct_df['date'].dt.strftime('%Y-%m-%d')
+                    fluct_df['price'] = fluct_df['price'].apply(lambda x: f"₹{x:.2f}")
+                    fluct_df['change_pct'] = fluct_df['change_pct'].apply(lambda x: f"{x:.2f}%")
+                    fluct_df.columns = ['Date', 'Price', 'Event Type', 'Change from Listing (%)']
                     
-                        # Fluctuations table
-                        st.subheader("📌 Identified Major Events")
-                        fluct_df = pd.DataFrame(fluctuations)
-                        fluct_df['date'] = fluct_df['date'].dt.strftime('%Y-%m-%d')
-                        fluct_df['price'] = fluct_df['price'].apply(lambda x: f"₹{x:.2f}")
-                        fluct_df['change_pct'] = fluct_df['change_pct'].apply(lambda x: f"{x:.2f}%")
-                        fluct_df.columns = ['Date', 'Price', 'Event Type', 'Change from Listing (%)']
-                    
-                        st.dataframe(fluct_df, use_container_width=True, hide_index=True)
+                    st.dataframe(fluct_df, use_container_width=True, hide_index=True)
             
-                # Statistical Analysis
-                if show_statistics:
-                    st.markdown("---")
-                    st.subheader("📊 Comprehensive Statistical Analysis")
+            # Statistical Analysis
+            if show_statistics:
+                st.markdown("---")
+                st.subheader("📊 Comprehensive Statistical Analysis")
                 
-                    stats_dict = calculate_statistics(data)
-                    interpretations = interpret_statistics(stats_dict, current_price)
+                stats_dict = calculate_statistics(data)
+                interpretations = interpret_statistics(stats_dict, current_price)
                 
-                    # Display statistics in organized sections
-                    tab1, tab2, tab3, tab4 = st.tabs(["📈 Descriptive Stats", "📉 Return Metrics", "⚠️ Risk Metrics", "📐 Technical Indicators"])
+                # Display statistics in organized sections
+                tab1, tab2, tab3, tab4 = st.tabs(["📈 Descriptive Stats", "📉 Return Metrics", "⚠️ Risk Metrics", "📐 Technical Indicators"])
                 
-                    with tab1:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Mean Price", f"₹{stats_dict['Mean Price']:.2f}")
-                            st.metric("Median Price", f"₹{stats_dict['Median Price']:.2f}")
-                            st.metric("Std Deviation", f"₹{stats_dict['Std Deviation']:.2f}")
-                            st.metric("Min Price", f"₹{stats_dict['Min Price']:.2f}")
-                        with col2:
-                            st.metric("Max Price", f"₹{stats_dict['Max Price']:.2f}")
-                            st.metric("Price Range", f"₹{stats_dict['Range']:.2f}")
-                            st.metric("Coefficient of Variation", f"{stats_dict['Coefficient of Variation']:.2f}%")
-                            st.metric("Variance", f"{stats_dict['Variance']:.2f}")
-                
-                    with tab2:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Mean Daily Return", f"{stats_dict['Mean Daily Return']:.4f}%")
-                            st.metric("Median Daily Return", f"{stats_dict['Median Daily Return']:.4f}%")
-                            st.metric("Annualized Return", f"{stats_dict['Annualized Return']:.2f}%")
-                        with col2:
-                            st.metric("Return Std Dev", f"{stats_dict['Return Std Dev']:.4f}%")
-                            st.metric("Annualized Volatility", f"{stats_dict['Annualized Volatility']:.2f}%")
-                            st.metric("Skewness", f"{stats_dict['Skewness']:.4f}")
-                
-                    with tab3:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Sharpe Ratio", f"{stats_dict['Sharpe Ratio']:.4f}")
-                            st.metric("Sortino Ratio", f"{stats_dict['Sortino Ratio']:.4f}")
-                            st.metric("Max Drawdown", f"{stats_dict['Max Drawdown']:.2f}%")
-                        with col2:
-                            st.metric("Value at Risk (95%)", f"{stats_dict['Value at Risk (95%)']:.4f}%")
-                            st.metric("Conditional VaR", f"{stats_dict['Conditional VaR (95%)']:.4f}%")
-                            st.metric("Kurtosis", f"{stats_dict['Kurtosis']:.4f}")
-                
-                    with tab4:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("50-Day MA", f"₹{stats_dict['50-Day MA']:.2f}")
-                            st.metric("200-Day MA", f"₹{stats_dict['200-Day MA']:.2f}")
-                            if 'RSI (14)' in stats_dict:
-                                st.metric("RSI (14)", f"{stats_dict['RSI (14)']:.2f}")
-                        with col2:
-                            if 'MACD' in stats_dict:
-                                st.metric("MACD", f"{stats_dict['MACD']:.4f}")
-                            if 'MACD Signal' in stats_dict:
-                                st.metric("MACD Signal", f"{stats_dict['MACD Signal']:.4f}")
-                
-                    # Interpretations
-                    st.markdown("---")
-                    st.subheader("🔍 Statistical Interpretations")
-                    for interp in interpretations:
-                        st.info(interp)
-            
-                # Valuation Metrics
-                if show_valuation:
-                    st.markdown("---")
-                    st.subheader("💰 Valuation Metrics & Analysis")
-                
-                    valuation_metrics = get_valuation_metrics(info, current_price)
-                    valuation_interp = interpret_valuation(valuation_metrics)
-                
-                    col1, col2, col3 = st.columns(3)
-                
+                with tab1:
+                    col1, col2 = st.columns(2)
                     with col1:
-                        st.markdown("**Price Ratios**")
-                        st.write(f"**P/E Ratio:** {valuation_metrics['P/E Ratio']}")
-                        st.write(f"**Forward P/E:** {valuation_metrics['Forward P/E']}")
-                        st.write(f"**P/B Ratio:** {valuation_metrics['P/B Ratio']}")
-                        st.write(f"**P/S Ratio:** {valuation_metrics['P/S Ratio']}")
-                        st.write(f"**PEG Ratio:** {valuation_metrics['PEG Ratio']}")
-                
+                        st.metric("Mean Price", f"₹{stats_dict['Mean Price']:.2f}")
+                        st.metric("Median Price", f"₹{stats_dict['Median Price']:.2f}")
+                        st.metric("Std Deviation", f"₹{stats_dict['Std Deviation']:.2f}")
+                        st.metric("Min Price", f"₹{stats_dict['Min Price']:.2f}")
                     with col2:
-                        st.markdown("**Profitability**")
-                        st.write(f"**ROE:** {valuation_metrics['ROE (%)']}")
-                        st.write(f"**ROA:** {valuation_metrics['ROA (%)']}")
-                        st.write(f"**Profit Margin:** {valuation_metrics['Profit Margin (%)']}")
-                        st.write(f"**Dividend Yield:** {valuation_metrics['Dividend Yield (%)']}")
+                        st.metric("Max Price", f"₹{stats_dict['Max Price']:.2f}")
+                        st.metric("Price Range", f"₹{stats_dict['Range']:.2f}")
+                        st.metric("Coefficient of Variation", f"{stats_dict['Coefficient of Variation']:.2f}%")
+                        st.metric("Variance", f"{stats_dict['Variance']:.2f}")
                 
+                with tab2:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Mean Daily Return", f"{stats_dict['Mean Daily Return']:.4f}%")
+                        st.metric("Median Daily Return", f"{stats_dict['Median Daily Return']:.4f}%")
+                        st.metric("Annualized Return", f"{stats_dict['Annualized Return']:.2f}%")
+                    with col2:
+                        st.metric("Return Std Dev", f"{stats_dict['Return Std Dev']:.4f}%")
+                        st.metric("Annualized Volatility", f"{stats_dict['Annualized Volatility']:.2f}%")
+                        st.metric("Skewness", f"{stats_dict['Skewness']:.4f}")
+                
+                with tab3:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Sharpe Ratio", f"{stats_dict['Sharpe Ratio']:.4f}")
+                        st.metric("Sortino Ratio", f"{stats_dict['Sortino Ratio']:.4f}")
+                        st.metric("Max Drawdown", f"{stats_dict['Max Drawdown']:.2f}%")
+                    with col2:
+                        st.metric("Value at Risk (95%)", f"{stats_dict['Value at Risk (95%)']:.4f}%")
+                        st.metric("Conditional VaR", f"{stats_dict['Conditional VaR (95%)']:.4f}%")
+                        st.metric("Kurtosis", f"{stats_dict['Kurtosis']:.4f}")
+                
+                with tab4:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("50-Day MA", f"₹{stats_dict['50-Day MA']:.2f}")
+                        st.metric("200-Day MA", f"₹{stats_dict['200-Day MA']:.2f}")
+                        if 'RSI (14)' in stats_dict:
+                            st.metric("RSI (14)", f"{stats_dict['RSI (14)']:.2f}")
+                    with col2:
+                        if 'MACD' in stats_dict:
+                            st.metric("MACD", f"{stats_dict['MACD']:.4f}")
+                        if 'MACD Signal' in stats_dict:
+                            st.metric("MACD Signal", f"{stats_dict['MACD Signal']:.4f}")
+                
+                # Interpretations
+                st.markdown("---")
+                st.subheader("🔍 Statistical Interpretations")
+                for interp in interpretations:
+                    st.info(interp)
+            
+            # Valuation Metrics
+            if show_valuation:
+                st.markdown("---")
+                st.subheader("💰 Valuation Metrics & Analysis")
+                
+                valuation_metrics = get_valuation_metrics(info, current_price)
+                valuation_interp = interpret_valuation(valuation_metrics)
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**Price Ratios**")
+                    st.write(f"**P/E Ratio:** {valuation_metrics['P/E Ratio']}")
+                    st.write(f"**Forward P/E:** {valuation_metrics['Forward P/E']}")
+                    st.write(f"**P/B Ratio:** {valuation_metrics['P/B Ratio']}")
+                    st.write(f"**P/S Ratio:** {valuation_metrics['P/S Ratio']}")
+                    st.write(f"**PEG Ratio:** {valuation_metrics['PEG Ratio']}")
+                
+                with col2:
+                    st.markdown("**Profitability**")
+                    st.write(f"**ROE:** {valuation_metrics['ROE (%)']}")
+                    st.write(f"**ROA:** {valuation_metrics['ROA (%)']}")
+                    st.write(f"**Profit Margin:** {valuation_metrics['Profit Margin (%)']}")
+                    st.write(f"**Dividend Yield:** {valuation_metrics['Dividend Yield (%)']}")
+                
+                with col3:
+                    st.markdown("**Market Metrics**")
+                    market_cap = valuation_metrics['Market Cap']
+                    if market_cap != 'N/A':
+                        st.write(f"**Market Cap:** ₹{market_cap/10000000:.2f} Cr")
+                    else:
+                        st.write(f"**Market Cap:** N/A")
+                    
+                    ent_val = valuation_metrics['Enterprise Value']
+                    if ent_val != 'N/A':
+                        st.write(f"**Enterprise Value:** ₹{ent_val/10000000:.2f} Cr")
+                    else:
+                        st.write(f"**Enterprise Value:** N/A")
+                    
+                    st.write(f"**Beta (vs Nifty 50):** {valuation_metrics['Beta (vs Nifty 50)']}")
+                
+                st.markdown("---")
+                st.subheader("📊 Valuation Interpretations")
+                for interp in valuation_interp:
+                    st.success(interp)
+            
+            # Price Forecast
+            if show_forecast:
+                st.markdown("---")
+                st.subheader("🔮 Price Forecast")
+                
+                with st.spinner("Generating forecasts..."):
+                    forecast_df, ensemble = forecast_prices(data, periods=forecast_days)
+                
+                if forecast_df is not None:
+                    # Forecast chart
+                    fig = go.Figure()
+                    
+                    # Historical prices
+                    fig.add_trace(go.Scatter(
+                        x=data.index[-90:],
+                        y=data['Close'].tail(90),
+                        mode='lines',
+                        name='Historical Price',
+                        line=dict(color='#1f77b4', width=2)
+                    ))
+                    
+                    # Forecast
+                    fig.add_trace(go.Scatter(
+                        x=forecast_df['Date'],
+                        y=forecast_df['Forecast'],
+                        mode='lines',
+                        name='Forecast',
+                        line=dict(color='#ff7f0e', width=2, dash='dash')
+                    ))
+                    
+                    # Confidence interval
+                    fig.add_trace(go.Scatter(
+                        x=forecast_df['Date'],
+                        y=forecast_df['Upper Bound'],
+                        mode='lines',
+                        name='Upper Bound (95%)',
+                        line=dict(width=0),
+                        showlegend=False
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=forecast_df['Date'],
+                        y=forecast_df['Lower Bound'],
+                        mode='lines',
+                        name='Lower Bound (95%)',
+                        line=dict(width=0),
+                        fillcolor='rgba(255, 127, 14, 0.2)',
+                        fill='tonexty',
+                        showlegend=False
+                    ))
+                    
+                    fig.update_layout(
+                        title=f"{company_name} - {forecast_days} Day Price Forecast",
+                        xaxis_title="Date",
+                        yaxis_title="Price (₹)",
+                        hovermode='x unified',
+                        height=500
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Forecast summary
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Current Price", f"₹{current_price:.2f}")
+                    with col2:
+                        forecast_price = forecast_df['Forecast'].iloc[-1]
+                        forecast_change = ((forecast_price - current_price) / current_price) * 100
+                        st.metric(f"{forecast_days}-Day Forecast", f"₹{forecast_price:.2f}", f"{forecast_change:.2f}%")
                     with col3:
-                        st.markdown("**Market Metrics**")
-                        market_cap = valuation_metrics['Market Cap']
-                        if market_cap != 'N/A':
-                            st.write(f"**Market Cap:** ₹{market_cap/10000000:.2f} Cr")
-                        else:
-                            st.write(f"**Market Cap:** N/A")
+                        st.metric("Upper Bound", f"₹{forecast_df['Upper Bound'].iloc[-1]:.2f}")
+                    with col4:
+                        st.metric("Lower Bound", f"₹{forecast_df['Lower Bound'].iloc[-1]:.2f}")
                     
-                        ent_val = valuation_metrics['Enterprise Value']
-                        if ent_val != 'N/A':
-                            st.write(f"**Enterprise Value:** ₹{ent_val/10000000:.2f} Cr")
-                        else:
-                            st.write(f"**Enterprise Value:** N/A")
-                    
-                        st.write(f"**Beta (vs Nifty 50):** {valuation_metrics['Beta (vs Nifty 50)']}")
-                
+                    # Forecast interpretation
                     st.markdown("---")
-                    st.subheader("📊 Valuation Interpretations")
-                    for interp in valuation_interp:
-                        st.success(interp)
-            
-                # Price Forecast
-                if show_forecast:
-                    st.markdown("---")
-                    st.subheader("🔮 Price Forecast")
-                
-                    with st.spinner("Generating forecasts..."):
-                        forecast_df, ensemble = forecast_prices(data, periods=forecast_days)
-                
-                    if forecast_df is not None:
-                        # Forecast chart
-                        fig = go.Figure()
+                    st.subheader("📝 Forecast Interpretation")
                     
-                        # Historical prices
-                        fig.add_trace(go.Scatter(
-                            x=data.index[-90:],
-                            y=data['Close'].tail(90),
-                            mode='lines',
-                            name='Historical Price',
-                            line=dict(color='#1f77b4', width=2)
-                        ))
+                    if forecast_change > 10:
+                        st.success(f"🚀 **Bullish Outlook**: Models predict a potential {forecast_change:.2f}% increase over the next {forecast_days} days.")
+                    elif forecast_change > 0:
+                        st.info(f"📈 **Positive Outlook**: Models suggest a modest {forecast_change:.2f}% gain over the next {forecast_days} days.")
+                    elif forecast_change > -10:
+                        st.warning(f"📉 **Slight Decline**: Models predict a {abs(forecast_change):.2f}% decrease over the next {forecast_days} days.")
+                    else:
+                        st.error(f"🔻 **Bearish Outlook**: Models suggest a significant {abs(forecast_change):.2f}% decline over the next {forecast_days} days.")
                     
-                        # Forecast
-                        fig.add_trace(go.Scatter(
-                            x=forecast_df['Date'],
-                            y=forecast_df['Forecast'],
-                            mode='lines',
-                            name='Forecast',
-                            line=dict(color='#ff7f0e', width=2, dash='dash')
-                        ))
+                    st.info("⚠️ **Disclaimer**: Forecasts are based on historical data and statistical models. Actual prices may vary significantly due to market conditions, news events, and other factors. Past performance does not guarantee future results.")
                     
-                        # Confidence interval
-                        fig.add_trace(go.Scatter(
-                            x=forecast_df['Date'],
-                            y=forecast_df['Upper Bound'],
-                            mode='lines',
-                            name='Upper Bound (95%)',
-                            line=dict(width=0),
-                            showlegend=False
-                        ))
+                    # Show forecast data
+                    with st.expander("📋 View Detailed Forecast Data"):
+                        display_df = forecast_df.copy()
+                        display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+                        for col in ['Forecast', 'Upper Bound', 'Lower Bound', 'Linear Regression', 'ARIMA', 'Exponential Smoothing', 'Moving Average']:
+                            if col in display_df.columns:
+                                display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}")
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
                     
-                        fig.add_trace(go.Scatter(
-                            x=forecast_df['Date'],
-                            y=forecast_df['Lower Bound'],
-                            mode='lines',
-                            name='Lower Bound (95%)',
-                            line=dict(width=0),
-                            fillcolor='rgba(255, 127, 14, 0.2)',
-                            fill='tonexty',
-                            showlegend=False
-                        ))
-                    
-                        fig.update_layout(
-                            title=f"{company_name} - {forecast_days} Day Price Forecast",
-                            xaxis_title="Date",
-                            yaxis_title="Price (₹)",
-                            hovermode='x unified',
-                            height=500
-                        )
-                    
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                        # Forecast summary
+                    # Model comparison
+                    with st.expander("🔬 View Model Comparison"):
+                        st.markdown("### Individual Model Forecasts")
                         col1, col2, col3, col4 = st.columns(4)
-                    
+                        
                         with col1:
-                            st.metric("Current Price", f"₹{current_price:.2f}")
+                            lr_final = forecast_df['Linear Regression'].iloc[-1]
+                            lr_change = ((lr_final - current_price) / current_price) * 100
+                            st.metric("Linear Regression", f"₹{lr_final:.2f}", f"{lr_change:.2f}%")
+                        
                         with col2:
-                            forecast_price = forecast_df['Forecast'].iloc[-1]
-                            forecast_change = ((forecast_price - current_price) / current_price) * 100
-                            st.metric(f"{forecast_days}-Day Forecast", f"₹{forecast_price:.2f}", f"{forecast_change:.2f}%")
+                            arima_final = forecast_df['ARIMA'].iloc[-1]
+                            arima_change = ((arima_final - current_price) / current_price) * 100
+                            st.metric("ARIMA", f"₹{arima_final:.2f}", f"{arima_change:.2f}%")
+                        
                         with col3:
-                            st.metric("Upper Bound", f"₹{forecast_df['Upper Bound'].iloc[-1]:.2f}")
+                            es_final = forecast_df['Exponential Smoothing'].iloc[-1]
+                            es_change = ((es_final - current_price) / current_price) * 100
+                            st.metric("Exp. Smoothing", f"₹{es_final:.2f}", f"{es_change:.2f}%")
+                        
                         with col4:
-                            st.metric("Lower Bound", f"₹{forecast_df['Lower Bound'].iloc[-1]:.2f}")
-                    
-                        # Forecast interpretation
-                        st.markdown("---")
-                        st.subheader("📝 Forecast Interpretation")
-                    
-                        if forecast_change > 10:
-                            st.success(f"🚀 **Bullish Outlook**: Models predict a potential {forecast_change:.2f}% increase over the next {forecast_days} days.")
-                        elif forecast_change > 0:
-                            st.info(f"📈 **Positive Outlook**: Models suggest a modest {forecast_change:.2f}% gain over the next {forecast_days} days.")
-                        elif forecast_change > -10:
-                            st.warning(f"📉 **Slight Decline**: Models predict a {abs(forecast_change):.2f}% decrease over the next {forecast_days} days.")
-                        else:
-                            st.error(f"🔻 **Bearish Outlook**: Models suggest a significant {abs(forecast_change):.2f}% decline over the next {forecast_days} days.")
-                    
-                        st.info("⚠️ **Disclaimer**: Forecasts are based on historical data and statistical models. Actual prices may vary significantly due to market conditions, news events, and other factors. Past performance does not guarantee future results.")
-                    
-                        # Show forecast data
-                        with st.expander("📋 View Detailed Forecast Data"):
-                            display_df = forecast_df.copy()
-                            display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
-                            for col in ['Forecast', 'Upper Bound', 'Lower Bound', 'Linear Regression', 'ARIMA', 'Exponential Smoothing', 'Moving Average']:
-                                if col in display_df.columns:
-                                    display_df[col] = display_df[col].apply(lambda x: f"₹{x:.2f}")
-                            st.dataframe(display_df, use_container_width=True, hide_index=True)
-                    
-                        # Model comparison
-                        with st.expander("🔬 View Model Comparison"):
-                            st.markdown("### Individual Model Forecasts")
-                            col1, col2, col3, col4 = st.columns(4)
+                            ma_final = forecast_df['Moving Average'].iloc[-1]
+                            ma_change = ((ma_final - current_price) / current_price) * 100
+                            st.metric("Moving Average", f"₹{ma_final:.2f}", f"{ma_change:.2f}%")
                         
-                            with col1:
-                                lr_final = forecast_df['Linear Regression'].iloc[-1]
-                                lr_change = ((lr_final - current_price) / current_price) * 100
-                                st.metric("Linear Regression", f"₹{lr_final:.2f}", f"{lr_change:.2f}%")
-                        
-                            with col2:
-                                arima_final = forecast_df['ARIMA'].iloc[-1]
-                                arima_change = ((arima_final - current_price) / current_price) * 100
-                                st.metric("ARIMA", f"₹{arima_final:.2f}", f"{arima_change:.2f}%")
-                        
-                            with col3:
-                                es_final = forecast_df['Exponential Smoothing'].iloc[-1]
-                                es_change = ((es_final - current_price) / current_price) * 100
-                                st.metric("Exp. Smoothing", f"₹{es_final:.2f}", f"{es_change:.2f}%")
-                        
-                            with col4:
-                                ma_final = forecast_df['Moving Average'].iloc[-1]
-                                ma_change = ((ma_final - current_price) / current_price) * 100
-                                st.metric("Moving Average", f"₹{ma_final:.2f}", f"{ma_change:.2f}%")
-                        
-                            st.info("**Ensemble Forecast** combines all models with weighted averaging for better accuracy.")
+                        st.info("**Ensemble Forecast** combines all models with weighted averaging for better accuracy.")
             
-                # News & Events Section
-                if show_news:
-                    st.markdown("---")
-                    st.subheader("📰 News & Market Events")
+            # News & Events Section
+            if show_news:
+                st.markdown("---")
+                st.subheader("📰 News & Market Events")
                 
-                    tab1, tab2, tab3, tab4 = st.tabs(["📰 Latest News", "🏦 FII/DII Data", "📊 Corporate Actions", "👥 Shareholding Pattern"])
+                tab1, tab2, tab3, tab4 = st.tabs(["📰 Latest News", "🏦 FII/DII Data", "📊 Corporate Actions", "👥 Shareholding Pattern"])
                 
-                    with tab1:
-                        st.markdown("### Latest News Articles")
-                        news_items = get_company_news(company_name, ticker + '.NS')
+                with tab1:
+                    st.markdown("### Latest News Articles")
+                    news_items = get_company_news(company_name, ticker + '.NS')
                     
-                        if news_items:
-                            for item in news_items:
-                                with st.container():
-                                    st.markdown(f"**{item['title']}**")
-                                    st.caption(f"📅 {item['date']} | 📰 {item['publisher']}")
-                                    st.markdown(f"[Read more]({item['link']})")
-                                    st.markdown("---")
-                        else:
-                            st.info("No recent news available.")
+                    if news_items:
+                        for item in news_items:
+                            with st.container():
+                                st.markdown(f"**{item['title']}**")
+                                st.caption(f"📅 {item['date']} | 📰 {item['publisher']}")
+                                st.markdown(f"[Read more]({item['link']})")
+                                st.markdown("---")
+                    else:
+                        st.info("No recent news available.")
                 
-                    with tab2:
-                        st.markdown("### FII/DII Inflows")
-                        fii_data = scrape_fii_dii_data()
+                with tab2:
+                    st.markdown("### FII/DII Inflows")
+                    fii_data = scrape_fii_dii_data()
                     
-                        if fii_data:
-                            st.success("✅ FII/DII data fetched from NSE")
+                    if fii_data:
+                        st.success("✅ FII/DII data fetched from NSE")
                         
-                            # Try to parse and display in a nice format
-                            try:
-                                if 'data' in fii_data:
-                                    df = pd.DataFrame(fii_data['data'])
-                                    st.dataframe(df, use_container_width=True)
-                                else:
-                                    st.json(fii_data)
-                            except:
+                        # Try to parse and display in a nice format
+                        try:
+                            if 'data' in fii_data:
+                                df = pd.DataFrame(fii_data['data'])
+                                st.dataframe(df, use_container_width=True)
+                            else:
                                 st.json(fii_data)
-                        else:
-                            st.info("FII/DII data not available. This data requires NSE API access with proper authentication.")
-                            st.markdown("""
-                            **Note**: Real-time FII/DII data requires:
-                            - NSE data subscription
-                            - Proper API authentication
-                            - Session management with NSE servers
+                        except:
+                            st.json(fii_data)
+                    else:
+                        st.info("FII/DII data not available. This data requires NSE API access with proper authentication.")
+                        st.markdown("""
+                        **Note**: Real-time FII/DII data requires:
+                        - NSE data subscription
+                        - Proper API authentication
+                        - Session management with NSE servers
                         
-                            You can manually check this data at: https://www.nseindia.com/reports-indices-institutional-investor-wise
-                            """)
+                        You can manually check this data at: https://www.nseindia.com/reports-indices-institutional-investor-wise
+                        """)
                 
-                    with tab3:
-                        st.markdown("### Corporate Actions & Announcements")
+                with tab3:
+                    st.markdown("### Corporate Actions & Announcements")
                     
-                        # Get corporate actions from NSE
-                        corp_actions = get_nse_corporate_actions(nse_symbol)
+                    # Get corporate actions from NSE
+                    corp_actions = get_nse_corporate_actions(nse_symbol)
                     
-                        if corp_actions:
-                            st.success("✅ Corporate actions data fetched from NSE")
-                            try:
-                                if isinstance(corp_actions, list):
-                                    df = pd.DataFrame(corp_actions)
-                                    st.dataframe(df, use_container_width=True)
-                                else:
-                                    st.json(corp_actions)
-                            except:
+                    if corp_actions:
+                        st.success("✅ Corporate actions data fetched from NSE")
+                        try:
+                            if isinstance(corp_actions, list):
+                                df = pd.DataFrame(corp_actions)
+                                st.dataframe(df, use_container_width=True)
+                            else:
                                 st.json(corp_actions)
+                        except:
+                            st.json(corp_actions)
                     
-                        # Dividend info from Yahoo Finance
-                        st.markdown("---")
-                        st.markdown("### Dividend Information")
-                        if info.get('dividendRate'):
-                            st.success(f"💵 **Dividend**: ₹{info.get('dividendRate', 'N/A')} per share")
-                            st.write(f"**Dividend Yield**: {info.get('dividendYield', 'N/A')}%")
-                            st.write(f"**Ex-Dividend Date**: {info.get('exDividendDate', 'N/A')}")
-                        else:
-                            st.info("No dividend information available")
+                    # Dividend info from Yahoo Finance
+                    st.markdown("---")
+                    st.markdown("### Dividend Information")
+                    if info.get('dividendRate'):
+                        st.success(f"💵 **Dividend**: ₹{info.get('dividendRate', 'N/A')} per share")
+                        st.write(f"**Dividend Yield**: {info.get('dividendYield', 'N/A')}%")
+                        st.write(f"**Ex-Dividend Date**: {info.get('exDividendDate', 'N/A')}")
+                    else:
+                        st.info("No dividend information available")
                     
-                        # Earnings date
-                        if info.get('earningsDate'):
-                            st.info(f"📅 **Next Earnings Date**: {info.get('earningsDate', 'N/A')}")
+                    # Earnings date
+                    if info.get('earningsDate'):
+                        st.info(f"📅 **Next Earnings Date**: {info.get('earningsDate', 'N/A')}")
                     
-                        if not corp_actions:
-                            st.info("For detailed corporate action history, visit: https://www.bseindia.com/corporates/corporates_act.aspx")
+                    if not corp_actions:
+                        st.info("For detailed corporate action history, visit: https://www.bseindia.com/corporates/corporates_act.aspx")
                 
-                    with tab4:
-                        st.markdown("### Shareholding Pattern")
+                with tab4:
+                    st.markdown("### Shareholding Pattern")
                     
-                        shareholding = get_nse_shareholding(nse_symbol)
+                    shareholding = get_nse_shareholding(nse_symbol)
                     
-                        if shareholding:
-                            st.success("✅ Shareholding data fetched from NSE")
-                            try:
-                                # Display shareholding data
-                                if 'data' in shareholding:
-                                    for category, details in shareholding['data'].items():
-                                        st.subheader(category.replace('_', ' ').title())
-                                        if isinstance(details, list) and len(details) > 0:
-                                            df = pd.DataFrame(details)
-                                            st.dataframe(df, use_container_width=True)
-                                        elif isinstance(details, dict):
-                                            st.json(details)
-                                else:
-                                    st.json(shareholding)
-                            except Exception as e:
+                    if shareholding:
+                        st.success("✅ Shareholding data fetched from NSE")
+                        try:
+                            # Display shareholding data
+                            if 'data' in shareholding:
+                                for category, details in shareholding['data'].items():
+                                    st.subheader(category.replace('_', ' ').title())
+                                    if isinstance(details, list) and len(details) > 0:
+                                        df = pd.DataFrame(details)
+                                        st.dataframe(df, use_container_width=True)
+                                    elif isinstance(details, dict):
+                                        st.json(details)
+                            else:
                                 st.json(shareholding)
-                        else:
-                            st.info("Shareholding pattern data not available from NSE API")
-                            st.markdown("""
-                            **Note**: You can check shareholding patterns at:
-                            - NSE: https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern
-                            - BSE: https://www.bseindia.com/corporates/shpPromoterNGroup.aspx
-                            """)
+                        except Exception as e:
+                            st.json(shareholding)
+                    else:
+                        st.info("Shareholding pattern data not available from NSE API")
+                        st.markdown("""
+                        **Note**: You can check shareholding patterns at:
+                        - NSE: https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern
+                        - BSE: https://www.bseindia.com/corporates/shpPromoterNGroup.aspx
+                        """)
         
         else:
             # BATCH ANALYSIS MODE - Multiple stocks
-            exchange_name = "NSE" if '.NS' in stocks_to_analyze[0] else "BSE"
-            st.header(f"📊 Batch Analysis: {len(stocks_to_analyze)} {exchange_name} Stocks")
-            st.info(f"Exchange detected: {exchange_name} | Sample ticker: {stocks_to_analyze[0]}")
+            st.header(f"📊 Batch Analysis: {len(stocks_to_analyze)} Stocks")
             
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -1442,8 +1327,7 @@ def main():
                 status_text.info(f"Analyzing {ticker}... ({idx+1}/{len(stocks_to_analyze)})")
                 
                 try:
-                    # Pass ticker WITH suffix so get_stock_data knows which exchange
-                    data_dict, info, nse_data, nse_symbol = get_stock_data(ticker_with_suffix)
+                    data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
                     
                     if data_dict and info:
                         data = reconstruct_dataframe(data_dict)
@@ -1471,14 +1355,9 @@ def main():
                         failed += 1
                 except Exception as e:
                     failed += 1
-                    # If rate limited, add extra delay
-                    if "Too Many Requests" in str(e) or "Rate limited" in str(e):
-                        time.sleep(2)  # Extra delay on rate limit
                 
                 progress_bar.progress((idx + 1) / len(stocks_to_analyze))
-                
-                # Use configurable delay (user can adjust based on rate limiting)
-                time.sleep(request_delay)
+                time.sleep(0.3)  # Delay to avoid rate limiting
             
             status_text.success(f"✅ Analysis complete! Valid: {len(results)} | Failed: {failed}")
             
