@@ -108,6 +108,39 @@ def calculate_beta_vs_nifty(stock_data, ticker):
         st.warning(f"Could not calculate beta: {e}")
         return None
 
+def calculate_beta_vs_sensex(stock_data, ticker):
+    """Calculate beta of stock vs Sensex (for BSE stocks)"""
+    try:
+        # Get Sensex data
+        sensex = yf.Ticker("^BSESN")
+        sensex_data = sensex.history(period="1y")
+        
+        if len(sensex_data) == 0:
+            return None
+        
+        # Align dates
+        stock_returns = stock_data['Close'].pct_change().dropna()
+        sensex_returns = sensex_data['Close'].pct_change().dropna()
+        
+        # Get common dates
+        common_dates = stock_returns.index.intersection(sensex_returns.index)
+        
+        if len(common_dates) < 30:  # Need at least 30 data points
+            return None
+        
+        stock_returns = stock_returns.loc[common_dates]
+        sensex_returns = sensex_returns.loc[common_dates]
+        
+        # Calculate beta using covariance method
+        covariance = np.cov(stock_returns, sensex_returns)[0][1]
+        variance = np.var(sensex_returns)
+        
+        beta = covariance / variance if variance != 0 else None
+        
+        return beta
+    except Exception as e:
+        return None
+
 @st.cache_data(ttl=3600)
 def scrape_nse_stock_info(symbol):
     """Scrape detailed stock information from NSE"""
@@ -162,15 +195,22 @@ def get_nse_shareholding(symbol):
 
 @st.cache_data(ttl=3600)
 def get_stock_data(ticker):
-    """Fetch stock data from Yahoo Finance and NSE"""
+    """Fetch stock data from Yahoo Finance - supports both NSE (.NS) and BSE (.BO)"""
     try:
-        # Store original ticker for NSE
-        nse_symbol = ticker.upper()
-        
-        # Add .NS suffix for NSE stocks if not present
-        if not ticker.endswith('.NS'):
+        # Determine exchange from ticker suffix
+        if ticker.endswith('.NS'):
+            exchange = 'NSE'
+            nse_symbol = ticker.replace('.NS', '').upper()
+        elif ticker.endswith('.BO'):
+            exchange = 'BSE'
+            nse_symbol = None  # BSE stocks don't have NSE data
+        else:
+            # If no suffix provided, default to NSE
+            exchange = 'NSE'
             ticker = ticker + '.NS'
+            nse_symbol = ticker.replace('.NS', '').upper()
         
+        # Fetch data from yfinance
         stock = yf.Ticker(ticker)
         data = stock.history(period="max")
         info = stock.info
@@ -181,14 +221,22 @@ def get_stock_data(ticker):
             'index': data.index.tolist()
         }
         
-        # Calculate proper beta vs Nifty 50
+        # Calculate beta vs appropriate index
         if data is not None and len(data) > 0:
-            calculated_beta = calculate_beta_vs_nifty(data, ticker)
+            if exchange == 'NSE':
+                # Compare with Nifty 50
+                calculated_beta = calculate_beta_vs_nifty(data, ticker)
+            else:
+                # Compare with Sensex for BSE
+                calculated_beta = calculate_beta_vs_sensex(data, ticker)
+            
             if calculated_beta is not None:
                 info['calculatedBeta'] = calculated_beta
         
-        # Get NSE data
-        nse_data = scrape_nse_stock_info(nse_symbol)
+        # Get NSE data only for NSE stocks
+        nse_data = None
+        if exchange == 'NSE' and nse_symbol:
+            nse_data = scrape_nse_stock_info(nse_symbol)
         
         return data_dict, info, nse_data, nse_symbol
     except Exception as e:
@@ -839,10 +887,12 @@ def main():
     if analyze_button and stocks_to_analyze:
         if len(stocks_to_analyze) == 1:
             # Single stock analysis (original flow)
-            ticker = stocks_to_analyze[0].replace('.NS', '').replace('.BO', '')
+            # DON'T strip suffix - get_stock_data needs it to determine exchange
+            ticker_with_suffix = stocks_to_analyze[0]
+            ticker = ticker_with_suffix.replace('.NS', '').replace('.BO', '')
             
             with st.spinner(f"Fetching data for {ticker}..."):
-                data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
+                data_dict, info, nse_data, nse_symbol = get_stock_data(ticker_with_suffix)
         
         if data_dict is not None and info:
             # Reconstruct DataFrame from cached dict
@@ -899,10 +949,14 @@ def main():
                 else:
                     st.write("**Market Cap:**", 'N/A')
             with col3:
-                # Show calculated beta vs Nifty 50
+                # Show calculated beta vs appropriate index
                 calc_beta = info.get('calculatedBeta', info.get('beta', 'N/A'))
+                
+                # Determine index based on ticker
+                index_name = "Sensex" if '.BO' in ticker_with_suffix else "Nifty 50"
+                
                 if calc_beta != 'N/A' and calc_beta is not None:
-                    st.write("**Beta (vs Nifty 50):**", f"{calc_beta:.3f}")
+                    st.write(f"**Beta (vs {index_name}):**", f"{calc_beta:.3f}")
                 else:
                     st.write("**Beta:**", 'N/A')
                 st.write("**Volume:**", f"{info.get('volume', 'N/A'):,}")
@@ -1327,7 +1381,8 @@ def main():
                 status_text.info(f"Analyzing {ticker}... ({idx+1}/{len(stocks_to_analyze)})")
                 
                 try:
-                    data_dict, info, nse_data, nse_symbol = get_stock_data(ticker)
+                    # Pass ticker WITH suffix so get_stock_data knows exchange
+                    data_dict, info, nse_data, nse_symbol = get_stock_data(ticker_with_suffix)
                     
                     if data_dict and info:
                         data = reconstruct_dataframe(data_dict)
