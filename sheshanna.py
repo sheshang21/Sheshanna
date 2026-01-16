@@ -705,7 +705,7 @@ def get_valuation_metrics(info, current_price):
     
     return metrics
 
-def interpret_valuation(metrics):
+def interpret_valuation(metrics, ticker_with_suffix):
     """Interpret valuation metrics"""
     interpretations = []
     
@@ -741,13 +741,16 @@ def interpret_valuation(metrics):
     
     # Beta interpretation
     beta = metrics.get('Beta (vs Nifty 50)', 'N/A')
+    # Determine index based on ticker
+    index_name = "Sensex" if '.BO' in ticker_with_suffix else "Nifty 50"
+    
     if beta != 'N/A' and beta is not None:
         if beta > 1.2:
-            interpretations.append("📊 **High Beta**: Stock is more volatile than Nifty 50, higher risk but potential for higher returns.")
+            interpretations.append(f"📊 **High Beta**: Stock is more volatile than {index_name}, higher risk but potential for higher returns.")
         elif beta > 0.8:
-            interpretations.append("📊 **Moderate Beta**: Stock moves roughly in line with Nifty 50.")
+            interpretations.append(f"📊 **Moderate Beta**: Stock moves roughly in line with {index_name}.")
         else:
-            interpretations.append("📊 **Low Beta**: Stock is less volatile than Nifty 50, more defensive.")
+            interpretations.append(f"📊 **Low Beta**: Stock is less volatile than {index_name}, more defensive.")
     
     # Dividend interpretation
     div_yield = metrics.get('Dividend Yield (%)', 'N/A')
@@ -1089,7 +1092,7 @@ def main():
                 st.subheader("💰 Valuation Metrics & Analysis")
                 
                 valuation_metrics = get_valuation_metrics(info, current_price)
-                valuation_interp = interpret_valuation(valuation_metrics)
+                valuation_interp = interpret_valuation(valuation_metrics, ticker_with_suffix)
                 
                 col1, col2, col3 = st.columns(3)
                 
@@ -1122,7 +1125,9 @@ def main():
                     else:
                         st.write(f"**Enterprise Value:** N/A")
                     
-                    st.write(f"**Beta (vs Nifty 50):** {valuation_metrics['Beta (vs Nifty 50)']}")
+                    # Show beta with correct index name
+                    index_name = "Sensex" if '.BO' in ticker_with_suffix else "Nifty 50"
+                    st.write(f"**Beta (vs {index_name}):** {valuation_metrics['Beta (vs Nifty 50)']}")
                 
                 st.markdown("---")
                 st.subheader("📊 Valuation Interpretations")
